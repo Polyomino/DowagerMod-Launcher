@@ -44,6 +44,29 @@ pub struct RepoStatus {
 /// network hangs (no route to the remote, VPN blackhole) so the UI can
 /// never wedge on `busy` forever.
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Clones transfer the whole history: allow ten minutes.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The mod repo cloned by the first-run Checkout flow.
+pub const MOD_REPO_URL: &str = "https://github.com/siegelh/DowagerMod";
+
+/// Validate a candidate mod checkout (Find flow, Settings): must be a
+/// git repo carrying the mod installer (either the batch entry point
+/// or the python behind it — one of the two survives a rename).
+pub fn validate_repo(path: &Path) -> Result<(), String> {
+    if !path.join(".git").exists() {
+        return Err(format!("not a git checkout: {}", path.display()));
+    }
+    let has_bat = deploy_script(path).is_file();
+    let has_install_py = path.join("CoreFiles").join("install.py").is_file();
+    if !has_bat && !has_install_py {
+        return Err(format!(
+            "not a DowagerMod checkout (installer not found): {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
 
 /// First `max` chars + "…" when longer (char-boundary safe).
 fn truncate(s: &str, max: usize) -> String {
@@ -68,12 +91,11 @@ pub(crate) fn hide_child_console(cmd: &mut Command) {
 pub(crate) fn hide_child_console(_cmd: &mut Command) {}
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    use std::io::Read;
     use std::process::Stdio;
 
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::setup::tool_path("git"));
     hide_child_console(&mut cmd);
-    let mut child = cmd
+    let child = cmd
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -85,8 +107,27 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run git: {e}"))?;
-    // Drain both pipes on helper threads so a chatty child can never
-    // wedge on a full buffer while we poll for its exit.
+    wait_child(
+        child,
+        &format!("git {}", args.join(" ")),
+        &repo.display().to_string(),
+        GIT_TIMEOUT,
+    )
+}
+
+/// Wait for a spawned git child with piped stdio: both pipes drain on
+/// helper threads so a chatty child can never wedge on a full buffer
+/// while we poll for its exit. Kills past `timeout`. `label` names the
+/// invocation (e.g. `git fetch --prune`), `where_` the workdir; both
+/// appear in the session log exactly like the old inline version.
+fn wait_child(
+    mut child: std::process::Child,
+    label: &str,
+    where_: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+
     let mut stdout = child.stdout.take();
     let out_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -118,9 +159,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
                     format!(" | {}", truncate(&err, 300))
                 };
                 crate::log::append(&format!(
-                    "git {} (in {}) -> {} in {:.1}s{detail}",
-                    args.join(" "),
-                    repo.display(),
+                    "{label} (in {where_}) -> {} in {:.1}s{detail}",
                     if status.success() { "ok" } else { "FAILED" },
                     start.elapsed().as_secs_f32()
                 ));
@@ -130,20 +169,14 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
                 return Err(String::from_utf8_lossy(&err).trim().to_string());
             }
             Ok(None) => {
-                if start.elapsed() > GIT_TIMEOUT {
+                if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let what = args.first().unwrap_or(&"?");
                     crate::log::append(&format!(
-                        "git {} (in {}) -> TIMEOUT after {}s",
-                        args.join(" "),
-                        repo.display(),
-                        GIT_TIMEOUT.as_secs()
+                        "{label} (in {where_}) -> TIMEOUT after {}s",
+                        timeout.as_secs()
                     ));
-                    return Err(format!(
-                        "git {what} timed out after {}s",
-                        GIT_TIMEOUT.as_secs()
-                    ));
+                    return Err(format!("{label} timed out after {}s", timeout.as_secs()));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -371,6 +404,50 @@ pub fn checkout(repo: &Path, branch: &str) -> Result<String, String> {
     git(repo, &["checkout", branch])
 }
 
+/// Clone `url` into `dest` (created; must be missing or an empty dir).
+/// Generous timeout: a first checkout transfers the whole history.
+pub fn clone_repo(url: &str, dest: &Path) -> Result<String, String> {
+    if dest.exists() {
+        let empty = dest.is_dir()
+            && std::fs::read_dir(dest)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
+        if !empty {
+            return Err(
+                "destination already exists and is not empty — pick an empty folder or a new path"
+                    .to_string(),
+            );
+        }
+    }
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let mut cmd = Command::new(crate::setup::tool_path("git"));
+    hide_child_console(&mut cmd);
+    let child = cmd
+        .arg("clone")
+        .arg(url)
+        .arg(dest)
+        // Same as `git()`: never block on a credential prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(parent)
+        .spawn()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    wait_child(
+        child,
+        &format!("git clone {url}"),
+        &parent.display().to_string(),
+        CLONE_TIMEOUT,
+    )
+    .map(|_| format!("checked out {}", dest.display()))
+}
+
 /// Short human age, e.g. `3d ago`. Pure function for unit tests.
 pub fn relative_time(commit_time_unix: i64, now_unix: i64) -> String {
     let delta = (now_unix - commit_time_unix).max(0);
@@ -594,6 +671,36 @@ mod tests {
     }
 
     #[test]
+    fn repo_validation_requires_git_plus_installer() {
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let err = validate_repo(&plain).unwrap_err();
+        assert!(err.contains("not a git checkout"), "got: {err}");
+
+        let nogit = root.path().join("nogit");
+        std::fs::create_dir(&nogit).unwrap();
+        std::fs::write(nogit.join("Install DowagerMod.bat"), "x").unwrap();
+        assert!(validate_repo(&nogit).is_err(), "bat alone is not enough");
+
+        let norepo = root.path().join("other-repo");
+        std::fs::create_dir_all(norepo.join(".git")).unwrap();
+        let err = validate_repo(&norepo).unwrap_err();
+        assert!(err.contains("not a DowagerMod checkout"), "got: {err}");
+
+        let via_bat = root.path().join("via-bat");
+        std::fs::create_dir_all(via_bat.join(".git")).unwrap();
+        std::fs::write(via_bat.join("Install DowagerMod.bat"), "x").unwrap();
+        assert!(validate_repo(&via_bat).is_ok());
+
+        let via_py = root.path().join("via-py");
+        std::fs::create_dir_all(via_py.join(".git")).unwrap();
+        std::fs::create_dir_all(via_py.join("CoreFiles")).unwrap();
+        std::fs::write(via_py.join("CoreFiles").join("install.py"), "x").unwrap();
+        assert!(validate_repo(&via_py).is_ok());
+    }
+
+    #[test]
     fn refuses_suspicious_branch_names() {
         let repo = Path::new("C:\\nope");
         assert!(checkout(repo, "").is_err());
@@ -747,5 +854,36 @@ mod cli_tests {
         checkout(&pair.b, "frost").unwrap();
         assert_eq!(current_branch(&pair.b).as_deref(), Some("frost"));
         assert!(pair.b.join("frost.txt").is_file());
+    }
+
+    #[test]
+    fn clone_checks_out_a_local_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        git(&src, &["init", "--quiet"]);
+        identify(&src);
+        commit_file(&src, "mod.txt", "dowager");
+        // Local-path clone: fully offline, exercises the same runner.
+        let dest = root.path().join("fresh").join("DowagerMod");
+        let msg = clone_repo(src.to_str().unwrap(), &dest).expect("clone succeeds");
+        assert!(msg.contains("checked out"), "got: {msg}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("mod.txt")).unwrap(),
+            "dowager"
+        );
+    }
+
+    #[test]
+    fn clone_refuses_non_empty_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        git(&src, &["init", "--quiet"]);
+        let busy = root.path().join("busy");
+        std::fs::create_dir(&busy).unwrap();
+        std::fs::write(busy.join("x.txt"), "x").unwrap();
+        let err = clone_repo(src.to_str().unwrap(), &busy).unwrap_err();
+        assert!(err.contains("not empty"), "got: {err}");
     }
 }

@@ -55,6 +55,32 @@ pub fn civ_log_dir() -> Option<PathBuf> {
     dirs::document_dir().map(|d| d.join("My Games").join("Beyond the Sword").join("Logs"))
 }
 
+/// Validate the exe override on Save: empty (auto-detect) is fine,
+/// otherwise it must point at an existing file.
+pub fn validate_exe_override(path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let p = Path::new(trimmed);
+    if p.is_file() {
+        Ok(())
+    } else {
+        Err(format!("civ exe not found: {}", p.display()))
+    }
+}
+
+/// Warning-grade name check: the BTS exe has a fixed name, so anything
+/// else is probably a misclick (renamed exes still launch, hence not
+/// an error).
+pub fn is_bts_exe_name(path: &str) -> bool {
+    Path::new(path.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case(GAME_EXE_NAME))
+        .unwrap_or(false)
+}
+
 /// Live Civ4 install dir remembered by the installer, if any.
 pub fn installed_game_dir() -> Option<PathBuf> {
     let dir = installer_config()?
@@ -398,6 +424,28 @@ mod tests {
                 "installer config must stay valid JSON"
             );
         }
+    }
+
+    #[test]
+    fn exe_override_validation() {
+        assert!(validate_exe_override("").is_ok());
+        assert!(validate_exe_override("   ").is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Civ4BeyondSword.exe");
+        std::fs::write(&exe, "fake").unwrap();
+        assert!(validate_exe_override(&exe.to_string_lossy()).is_ok());
+        assert!(validate_exe_override(dir.path().to_str().unwrap()).is_err());
+        let err =
+            validate_exe_override(&dir.path().join("missing.exe").to_string_lossy()).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn bts_exe_name_check_is_case_insensitive() {
+        assert!(is_bts_exe_name("C:\\game\\Civ4BeyondSword.exe"));
+        assert!(is_bts_exe_name("civ4beyondsword.exe"));
+        assert!(!is_bts_exe_name("C:\\game\\Civ4Warlords.exe"));
+        assert!(!is_bts_exe_name(""));
     }
 
     #[test]

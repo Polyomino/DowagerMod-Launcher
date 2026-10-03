@@ -85,6 +85,19 @@ impl LauncherConfig {
     }
 }
 
+/// Default first-checkout destination: `DowagerMod` next to the
+/// running executable, else next to the working directory.
+pub fn default_clone_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join(DEFAULT_REPO_DIR_NAME);
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(DEFAULT_REPO_DIR_NAME)
+}
+
 /// Auto-detect `<...>/DowagerMod` next to the running executable or the
 /// current working directory (covers `cargo run` from the launcher project).
 pub fn default_repo_path() -> Option<PathBuf> {
@@ -143,6 +156,15 @@ mod tests {
         assert_eq!(parse_app_id("1234", 8800), 1234);
         assert_eq!(parse_app_id("", 8800), 8800);
         assert_eq!(parse_app_id("xyz", 8800), 8800);
+    }
+
+    #[test]
+    fn default_clone_dir_targets_dowagermod_folder() {
+        let dir = default_clone_dir();
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(DEFAULT_REPO_DIR_NAME)
+        );
     }
 
     #[test]

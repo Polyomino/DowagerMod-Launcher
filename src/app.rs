@@ -1,12 +1,12 @@
 //! eframe/egui front end: status card, searchable branch list, update/deploy/launch.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::LauncherConfig;
 use crate::git::{self, BranchInfo, RepoStatus};
-use crate::{civ, config, report, update};
+use crate::{civ, config, report, setup, update};
 
 /// Warm bronze accent — Civ-appropriate, and deliberately not the
 /// purple/blue default.
@@ -42,6 +42,55 @@ enum JobOut {
     /// Update download/apply failed (success exits the process, so only
     /// failure needs a message).
     UpdateFailed(String),
+    /// Native file dialog closed: the picked path, or `None` on cancel.
+    /// No epoch (a pick can't be orphaned by repo activity).
+    Picked(PickTarget, Option<PathBuf>),
+    /// Git ensure finished: how to spawn it, or a reason. No epoch.
+    GitEnsured(Result<PathBuf, String>),
+    /// `git clone` finished. No epoch (only one clone runs at a time,
+    /// behind `busy`).
+    Cloned(Result<String, String>),
+    /// `gh` ensure finished. No epoch.
+    GhEnsured(Result<(), String>),
+    /// `gh auth login` terminal closed: authed now, or a reason.
+    GhAuthed(Result<(), String>),
+}
+
+/// What a native file dialog is picking for: a Settings field, the
+/// empty-state Find flow (adopted + saved on pick), or the clone
+/// destination field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickTarget {
+    RepoDir,
+    CivExe,
+    FindRepo,
+    CloneDest,
+}
+
+/// Guided `gh` setup inside the Report dialog: install, then sign in.
+/// Only appears once a submit discovers gh missing or unauthenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GhFlow {
+    #[default]
+    Idle,
+    Missing,
+    Installing,
+    NeedsAuth,
+    Authing,
+}
+
+/// Starting folder for a Browse dialog: the draft dir itself when it
+/// exists, else its parent, else the dialog default.
+fn pick_start_dir(draft: &str) -> Option<PathBuf> {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(trimmed);
+    if p.is_dir() {
+        return Some(p);
+    }
+    p.parent().filter(|p| p.is_dir()).map(Path::to_path_buf)
 }
 
 /// One-time theme setup: bronze selection, roomier spacing.
@@ -125,6 +174,9 @@ fn looks_like_error(log: &str) -> bool {
         "fetch failed",
         "report failed",
         "update failed",
+        "install failed",
+        "clone failed",
+        "not a dowagermod checkout",
         "save failed",
         "failed to ",
         "failed:",
@@ -248,6 +300,17 @@ pub struct LauncherApp {
     update_downloading: bool,
     update_status: String,
     update_error: String,
+    /// A native file dialog is open for this target (Browse buttons off).
+    picking: Option<PickTarget>,
+    git_missing: bool,
+    git_installing: bool,
+    git_error: String,
+    show_clone: bool,
+    clone_dest: String,
+    clone_error: String,
+    find_error: String,
+    gh_flow: GhFlow,
+    gh_message: String,
     tx: Sender<JobOut>,
     rx: Receiver<JobOut>,
 }
@@ -255,8 +318,14 @@ pub struct LauncherApp {
 impl LauncherApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_style(&cc.egui_ctx);
-        let config = LauncherConfig::load();
-        let repo = config.repo_path();
+        let mut config = LauncherConfig::load();
+        let mut repo = config.repo_path();
+        // Demo/test hook: simulate a true first run (no configured
+        // path either, so the header reads like one).
+        if std::env::var("DML_NO_REPO").as_deref() == Ok("1") {
+            config.mod_repo_path = String::new();
+            repo = None;
+        }
         // Draft mirrors the stored value verbatim: empty means auto-detect.
         // (Prefilling the detected path here would freeze auto-detect into
         // an explicit path on the next Save.)
@@ -292,12 +361,30 @@ impl LauncherApp {
             update_downloading: false,
             update_status: String::new(),
             update_error: String::new(),
+            picking: None,
+            git_missing: false,
+            git_installing: false,
+            git_error: String::new(),
+            show_clone: false,
+            clone_dest: String::new(),
+            clone_error: String::new(),
+            find_error: String::new(),
+            gh_flow: GhFlow::Idle,
+            gh_message: String::new(),
             tx,
             rx,
         };
-        // Fast first paint: synchronous local-only snapshot (no network
-        // fetch), then a background thread does fetch + full refresh.
-        if let Some(repo) = app.repo.clone() {
+        // Tool check first: without git every repo call fails, so skip
+        // the sync snapshot and install it in the background instead.
+        // (One fast `--version` spawn; a missing binary fails fast.)
+        app.git_missing = !setup::tool_usable("git");
+        if app.git_missing {
+            app.spawn_git_install();
+        } else if let Some(repo) = app.ready_repo() {
+            // Fast first paint: synchronous local-only snapshot (no
+            // network fetch), then a background thread does fetch +
+            // full refresh. Skipped without a ready checkout (no
+            // pointless failure lines on the selection screen).
             match git::status(&repo, false) {
                 Ok(st) => app.status = Some(st),
                 Err(e) => app.set_log(e),
@@ -306,10 +393,9 @@ impl LauncherApp {
                 app.branches = list;
             }
             app.spawn_refresh(true);
-        } else {
-            app.set_log("DowagerMod checkout not found — set the path in Settings.".to_string());
-            app.show_settings = true;
         }
+        // No repo: the empty-state screen offers Find / Checkout (no
+        // auto-open Settings anymore).
         // Self-update check in the background (skipped for dev builds).
         if update::should_check() {
             app.spawn_update_check();
@@ -480,6 +566,154 @@ impl LauncherApp {
         });
     }
 
+    /// Open a native Browse dialog on a worker thread (the sync dialog
+    /// pumps its own loop; running it on the UI thread would stall
+    /// repaints behind it). The pick lands in the draft field and still
+    /// needs Save, same as typing it in.
+    fn spawn_pick(&mut self, target: PickTarget) {
+        if self.picking.is_some() {
+            return;
+        }
+        self.picking = Some(target);
+        let draft = match target {
+            PickTarget::RepoDir | PickTarget::FindRepo => self.draft_repo_path.clone(),
+            PickTarget::CivExe => self.draft_exe.clone(),
+            PickTarget::CloneDest => self.clone_dest.clone(),
+        };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut dlg = rfd::FileDialog::new();
+            if let Some(dir) = pick_start_dir(&draft) {
+                dlg = dlg.set_directory(dir);
+            }
+            let picked = match target {
+                PickTarget::RepoDir | PickTarget::FindRepo | PickTarget::CloneDest => {
+                    dlg.pick_folder()
+                }
+                PickTarget::CivExe => dlg.add_filter("Executable", &["exe"]).pick_file(),
+            };
+            let _ = tx.send(JobOut::Picked(target, picked));
+        });
+    }
+
+    fn spawn_git_install(&mut self) {
+        if self.git_installing {
+            return;
+        }
+        self.git_installing = true;
+        self.git_error.clear();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(JobOut::GitEnsured(setup::ensure_tool(
+                "git",
+                setup::GIT_WINGET_ID,
+            )));
+        });
+    }
+
+    fn spawn_clone(&mut self, dest: String) {
+        if self.busy.is_some() || self.deploying || self.git_missing {
+            return;
+        }
+        self.busy = Some("cloning…".to_string());
+        self.clone_error.clear();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let out = git::clone_repo(git::MOD_REPO_URL, Path::new(&dest));
+            let _ = tx.send(JobOut::Cloned(out));
+        });
+    }
+
+    fn spawn_gh_install(&mut self) {
+        if !matches!(self.gh_flow, GhFlow::Missing) {
+            return;
+        }
+        self.gh_flow = GhFlow::Installing;
+        self.gh_message.clear();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let out = setup::ensure_tool("gh", setup::GH_WINGET_ID).map(|_| ());
+            let _ = tx.send(JobOut::GhEnsured(out));
+        });
+    }
+
+    fn spawn_gh_auth(&mut self) {
+        if !matches!(self.gh_flow, GhFlow::NeedsAuth) {
+            return;
+        }
+        self.gh_flow = GhFlow::Authing;
+        self.gh_message.clear();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // Visible console on purpose: `gh auth login` is interactive
+            // (browser/device code the user completes in the terminal).
+            let out = match std::process::Command::new(setup::tool_path("gh"))
+                .arg("auth")
+                .arg("login")
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    if setup::gh_authed() {
+                        Ok(())
+                    } else {
+                        Err(
+                            "authentication incomplete — finish signing in and try again"
+                                .to_string(),
+                        )
+                    }
+                }
+                Err(e) => Err(format!("could not start gh auth: {e}")),
+            };
+            let _ = tx.send(JobOut::GhAuthed(out));
+        });
+    }
+
+    /// Submit via gh when possible; otherwise steer into the guided
+    /// install/auth flow (which auto-submits once gh is ready).
+    fn submit_or_setup_gh(&mut self, title: String, desc: String) {
+        if !setup::tool_usable("gh") {
+            self.gh_flow = GhFlow::Missing;
+            self.gh_message.clear();
+            return;
+        }
+        if !setup::gh_authed() {
+            self.gh_flow = GhFlow::NeedsAuth;
+            self.gh_message.clear();
+            return;
+        }
+        self.gh_flow = GhFlow::Idle;
+        self.spawn_report(title, desc);
+    }
+
+    /// The checkout when one is ready to manage: configured AND a
+    /// valid DowagerMod checkout. Anything else (missing, not a repo,
+    /// wrong folder) shows the Find / Checkout selection screen instead
+    /// — including stale configs saved before validation existed
+    /// (self-healing). A few fs stats per call; negligible.
+    fn ready_repo(&self) -> Option<PathBuf> {
+        self.repo.clone().filter(|r| git::validate_repo(r).is_ok())
+    }
+
+    /// Adopt a repo path (Find / Clone flows): validate, persist,
+    /// reset repo state, refresh. Invalid picks never touch the config —
+    /// the caller shows the error and stays on the selection screen.
+    fn adopt_repo(&mut self, path: PathBuf) -> Result<(), String> {
+        git::validate_repo(&path)?;
+        self.config.mod_repo_path = path.to_string_lossy().to_string();
+        self.config
+            .save()
+            .map_err(|e| format!("save failed: {e}"))?;
+        self.draft_repo_path = self.config.mod_repo_path.clone();
+        self.repo = Some(path);
+        self.job_epoch += 1;
+        self.status = None;
+        self.branches.clear();
+        self.selected = 0;
+        self.spawn_refresh(true);
+        Ok(())
+    }
+
     fn poll_jobs(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
             match job {
@@ -594,6 +828,97 @@ impl LauncherApp {
                     self.set_log(format!("update failed: {e}"));
                     self.update_error = format!("update failed: {e}");
                 }
+                JobOut::Picked(target, picked) => {
+                    self.picking = None;
+                    let Some(path) = picked else {
+                        return; // Cancel leaves everything untouched.
+                    };
+                    match target {
+                        PickTarget::RepoDir => {
+                            // A pick still needs Save, same as typing it in.
+                            self.draft_repo_path = path.to_string_lossy().to_string();
+                        }
+                        PickTarget::CivExe => {
+                            self.draft_exe = path.to_string_lossy().to_string();
+                        }
+                        PickTarget::CloneDest => {
+                            self.clone_dest = path.to_string_lossy().to_string();
+                        }
+                        PickTarget::FindRepo => {
+                            match self.adopt_repo(path) {
+                                Ok(()) => {
+                                    self.find_error.clear();
+                                    self.set_log("checkout selected — refreshing…".to_string());
+                                }
+                                Err(e) => {
+                                    // Back to the selection screen with
+                                    // the reason (config untouched).
+                                    self.set_log(e.clone());
+                                    self.find_error = e;
+                                }
+                            }
+                        }
+                    }
+                }
+                JobOut::GitEnsured(Ok(path)) => {
+                    self.git_installing = false;
+                    self.git_missing = false;
+                    if path.as_os_str() == "git" {
+                        self.set_log("git ready".to_string());
+                    } else {
+                        self.set_log(format!("git installed and ready ({})", path.display()));
+                    }
+                    // The initial snapshot was skipped without git.
+                    self.spawn_refresh(true);
+                }
+                JobOut::GitEnsured(Err(e)) => {
+                    self.git_installing = false;
+                    self.set_log(format!("install failed: {e}"));
+                    self.git_error = e;
+                }
+                JobOut::Cloned(Ok(msg)) => {
+                    self.busy = None;
+                    self.set_log(msg);
+                    // The clone is an explicit switch request: adopt it
+                    // even over an existing checkout (last action wins).
+                    // A surprise-invalid clone keeps the dialog open.
+                    match self.adopt_repo(PathBuf::from(self.clone_dest.trim())) {
+                        Ok(()) => self.show_clone = false,
+                        Err(e) => {
+                            self.set_log(e.clone());
+                            self.clone_error = e;
+                        }
+                    }
+                }
+                JobOut::Cloned(Err(e)) => {
+                    self.busy = None;
+                    self.set_log(format!("clone failed: {e}"));
+                    self.clone_error = e;
+                }
+                JobOut::GhEnsured(Ok(())) => {
+                    self.gh_flow = GhFlow::NeedsAuth;
+                    self.gh_message.clear();
+                }
+                JobOut::GhEnsured(Err(e)) => {
+                    self.gh_flow = GhFlow::Missing;
+                    self.gh_message = e;
+                }
+                JobOut::GhAuthed(Ok(())) => {
+                    self.gh_flow = GhFlow::Idle;
+                    self.gh_message.clear();
+                    // Signed in: continue straight into the submit the
+                    // user originally asked for.
+                    let title = self.report_title.trim().to_string();
+                    if title.is_empty() {
+                        self.report_result = "signed in — submit when ready".to_string();
+                    } else {
+                        self.spawn_report(title, self.report_desc.clone());
+                    }
+                }
+                JobOut::GhAuthed(Err(e)) => {
+                    self.gh_flow = GhFlow::NeedsAuth;
+                    self.gh_message = e;
+                }
             }
         }
     }
@@ -608,11 +933,19 @@ impl LauncherApp {
         self.log = msg;
     }
 
+    /// Open the clone dialog with a fresh destination (shared by the
+    /// empty-state screen and the Installed card button).
+    fn open_clone_dialog(&mut self) {
+        self.clone_dest = config::default_clone_dir().to_string_lossy().to_string();
+        self.clone_error.clear();
+        self.show_clone = true;
+    }
+
     fn checkout_selected(&mut self) {
         // Enter/double-click bypass the disabled-button gate, so guard here:
         // overlapping git jobs fight over the repo lock, and the payload
         // must not change while the installer reads it.
-        if self.busy.is_some() || self.deploying {
+        if self.busy.is_some() || self.deploying || self.git_missing {
             return;
         }
         if let Some(b) = self.filtered().get(self.selected).map(|b| b.name.clone()) {
@@ -643,7 +976,8 @@ impl eframe::App for LauncherApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R))
             && self.busy.is_none()
             && !self.deploying
-            && self.repo.is_some()
+            && !self.git_missing
+            && self.ready_repo().is_some()
         {
             self.spawn_refresh(true);
         }
@@ -653,7 +987,9 @@ impl eframe::App for LauncherApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                match &self.repo {
+                match self.ready_repo() {
+                    // Ready checkout only: a missing/invalid path shows the
+                    // guidance line instead of a nonsense folder name.
                     Some(repo) => {
                         let folder = repo
                             .file_name()
@@ -665,10 +1001,12 @@ impl eframe::App for LauncherApp {
                         )
                         .on_hover_text(repo.to_string_lossy());
                     }
-                    None => {
+                    _ => {
                         let configured = self.config.mod_repo_path.trim();
                         let msg = if configured.is_empty() {
-                            "mod checkout not found — set the path in Settings".to_string()
+                            "mod checkout not found — Find or Checkout below".to_string()
+                        } else if Path::new(configured).is_dir() {
+                            format!("not a DowagerMod checkout: {configured}")
                         } else {
                             format!("configured mod path not found: {configured}")
                         };
@@ -683,7 +1021,10 @@ impl eframe::App for LauncherApp {
                     }
                     // Refresh lives here (not in Branches): it refreshes
                     // status, branches, and the live-match line together.
-                    let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
+                    let busy = self.busy.is_some()
+                        || self.deploying
+                        || self.ready_repo().is_none()
+                        || self.git_missing;
                     if ui
                         .add_enabled(!busy, egui::Button::new("Refresh"))
                         .on_hover_text("Refresh status and branches (Ctrl+R)")
@@ -733,18 +1074,27 @@ impl eframe::App for LauncherApp {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.add_space(6.0);
-                    if self.show_settings {
-                        self.settings_ui(ui);
+                    if self.git_missing || self.git_installing || !self.git_error.is_empty() {
+                        self.git_banner_ui(ui);
                         ui.add_space(8.0);
                         ui.separator();
                     }
-                    self.status_ui(ui);
-                    ui.add_space(8.0);
-                    ui.separator();
-                    self.branches_ui(ui, ctx);
-                    ui.add_space(8.0);
-                    ui.separator();
-                    self.civ_ui(ui);
+                    // Settings replaces the pane (no bump-down); the
+                    // selection screen replaces it when no checkout is
+                    // ready.
+                    if self.show_settings {
+                        self.settings_ui(ui);
+                    } else if self.ready_repo().is_none() {
+                        self.no_repo_ui(ui);
+                    } else {
+                        self.status_ui(ui);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        self.branches_ui(ui, ctx);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        self.civ_ui(ui);
+                    }
                     ui.add_space(6.0);
                 });
         });
@@ -752,7 +1102,7 @@ impl eframe::App for LauncherApp {
         if self.show_report {
             // Repaint while sending so the spinner animates; result
             // arrival repaints via the mpsc poll anyway.
-            if self.report_sending {
+            if self.report_sending || matches!(self.gh_flow, GhFlow::Installing | GhFlow::Authing) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
             self.report_ui(ctx);
@@ -764,10 +1114,112 @@ impl eframe::App for LauncherApp {
             }
             self.update_ui(ctx);
         }
+
+        if self.show_clone {
+            self.clone_ui(ctx);
+        }
     }
 }
 
 impl LauncherApp {
+    /// Non-blocking git installer banner: playing stays available while
+    /// git is missing; only the git-backed buttons gate off it.
+    fn git_banner_ui(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(10))
+            .corner_radius(egui::CornerRadius::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if self.git_installing {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("installing git via winget… (approve any prompt; takes a few minutes)");
+                    });
+                } else if !self.git_error.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("git install failed: {}", self.git_error))
+                            .color(ERR_RED),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Retry install").clicked() {
+                            self.spawn_git_install();
+                        }
+                        ui.label(
+                            egui::RichText::new("or install git yourself and hit Retry")
+                                .small()
+                                .weak(),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Git is not installed — branch, update, and checkout features need it.",
+                            )
+                            .color(WARN_AMBER),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Install git")
+                            .on_hover_text("Install Git.Git via winget")
+                            .clicked()
+                        {
+                            self.spawn_git_install();
+                        }
+                        ui.label(
+                            egui::RichText::new("or install it yourself and hit Retry")
+                                .small()
+                                .weak(),
+                        );
+                    });
+                }
+            });
+    }
+
+    /// Whole-UI empty state: find the checkout on disk or clone it fresh.
+    fn no_repo_ui(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "DowagerMod checkout not found");
+        ui.label(
+            egui::RichText::new(
+                "Point the launcher at your clone, or clone a fresh one from GitHub.",
+            )
+            .weak(),
+        );
+        if !self.find_error.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(&self.find_error).color(ERR_RED));
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let picking = self.picking.is_some() || self.busy.is_some();
+            if ui
+                .add_enabled(!picking, primary_button("Find DowagerMod…", !picking))
+                .on_hover_text("Pick the DowagerMod folder on disk")
+                .clicked()
+            {
+                self.find_error.clear();
+                self.spawn_pick(PickTarget::FindRepo);
+            }
+            // Checkout shells to git: gated until git is ready.
+            let can_clone = !picking && !self.git_missing && !self.git_installing;
+            if ui
+                .add_enabled(can_clone, primary_button("Checkout DowagerMod", can_clone))
+                .on_hover_text("Clone a fresh copy from GitHub")
+                .on_disabled_hover_text("install git first")
+                .clicked()
+            {
+                self.open_clone_dialog();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("You can also set the path manually in Settings.")
+                .small()
+                .weak(),
+        );
+    }
+
     fn status_ui(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "Installed version");
         match &self.status {
@@ -821,14 +1273,19 @@ impl LauncherApp {
                                     .color(WARN_AMBER),
                             );
                         }
-                        // Full path lives here (not the header): visible
-                        // when debugging a wrong repo, quiet otherwise.
+                        // Full path lives here (not the header): always
+                        // visible so a wrong checkout is obvious.
                         if let Some(repo) = &self.repo {
-                            ui.label(
-                                egui::RichText::new(format!("repo: {}", repo.display()))
-                                    .small()
-                                    .weak(),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Location:").small().weak());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(repo.to_string_lossy()).monospace(),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(repo.to_string_lossy());
+                            });
                         }
                     });
             }
@@ -840,22 +1297,24 @@ impl LauncherApp {
                 }
             }
         }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            // No status (or a detached HEAD) means there is nothing sane to
-            // fast-forward; the git layer re-checks anyway. Blocked while
-            // deploying: the payload must not change mid-install.
-            let can_update =
-                self.repo.is_some() && matches!(&self.status, Some(st) if !st.detached);
-            let enabled = self.busy.is_none() && !self.deploying && can_update;
-            if ui
-                .add_enabled(enabled, primary_button("Update to latest", enabled))
-                .on_hover_text("Fast-forward this branch to its remote tip")
-                .clicked()
-            {
-                self.spawn_update();
-            }
-        });
+        // The button only appears when there is something to do: a
+        // branch behind its tip. Current, detached, and still-loading
+        // states show just the distance line (no dead button).
+        if matches!(&self.status, Some(st) if !st.detached && st.behind > 0) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                // Blocked while deploying: the payload must not change
+                // mid-install. The git layer re-checks anyway.
+                let enabled = self.busy.is_none() && !self.deploying && !self.git_missing;
+                if ui
+                    .add_enabled(enabled, primary_button("Update to latest", enabled))
+                    .on_hover_text("Fast-forward this branch to its remote tip")
+                    .clicked()
+                {
+                    self.spawn_update();
+                }
+            });
+        }
     }
 
     fn branches_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -941,7 +1400,8 @@ impl LauncherApp {
             });
         self.scroll_to_selected = false;
         ui.horizontal(|ui| {
-            let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
+            let busy =
+                self.busy.is_some() || self.deploying || self.repo.is_none() || self.git_missing;
             if ui
                 .add_enabled(!busy, egui::Button::new("Switch to selected"))
                 .on_hover_text("Check out the selected branch (Enter)")
@@ -961,6 +1421,16 @@ impl LauncherApp {
                 .small()
                 .weak(),
         );
+        if !self.config.civ_exe_override.trim().is_empty()
+            && !civ::is_bts_exe_name(&self.config.civ_exe_override)
+        {
+            ui.label(
+                egui::RichText::new(
+                    "override doesn't look like the BTS exe (expected Civ4BeyondSword.exe)",
+                )
+                .color(WARN_AMBER),
+            );
+        }
         match civ::installed_game_dir() {
             Some(dir) => {
                 let deployed = civ::is_mod_deployed(&dir);
@@ -1058,28 +1528,51 @@ impl LauncherApp {
         let detected = config::default_repo_path()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "auto-detect: not found".to_string());
-        egui::Grid::new("settings-grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Mod repo path:");
+        // Manual rows (not a Grid): grids size columns to content and
+        // never expand the TextEdits, leaving unusably narrow fields.
+        let label = |ui: &mut egui::Ui, text: &str| {
+            ui.add_sized([118.0, 20.0], egui::Label::new(text));
+        };
+        ui.horizontal(|ui| {
+            label(ui, "Mod repo path:");
+            // Button first from the right: a full-width field would
+            // otherwise shove it off-screen.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.picking.is_none(), egui::Button::new("Browse…"))
+                    .on_hover_text("Pick the DowagerMod checkout folder")
+                    .clicked()
+                {
+                    self.spawn_pick(PickTarget::RepoDir);
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.draft_repo_path)
                         .desired_width(f32::INFINITY)
                         .hint_text(format!("empty = auto-detect ({detected})")),
                 );
-                ui.end_row();
-                ui.label("Steam app id:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.draft_app_id).desired_width(f32::INFINITY),
-                );
-                ui.end_row();
-                ui.label("Civ exe override:");
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            label(ui, "Steam app id:");
+            ui.add(egui::TextEdit::singleline(&mut self.draft_app_id).desired_width(f32::INFINITY));
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            label(ui, "Civ exe override:");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.picking.is_none(), egui::Button::new("Browse…"))
+                    .on_hover_text("Pick Civ4BeyondSword.exe")
+                    .clicked()
+                {
+                    self.spawn_pick(PickTarget::CivExe);
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.draft_exe).desired_width(f32::INFINITY),
                 );
-                ui.end_row();
             });
+        });
         ui.add_space(4.0);
         // Gated while any job runs: a repo switch must not overlap git
         // (lock fights) or the installer (payload reads). Bounded by the
@@ -1089,7 +1582,21 @@ impl LauncherApp {
             .add_enabled(save_idle, egui::Button::new("Save"))
             .clicked()
         {
-            self.config.mod_repo_path = self.draft_repo_path.trim().to_string();
+            // Validate before touching anything: an invalid path refuses
+            // the save instead of wedging the UI into a broken state.
+            // (Empty repo path = auto-detect, always allowed.)
+            let repo_draft = self.draft_repo_path.trim().to_string();
+            if !repo_draft.is_empty() {
+                if let Err(e) = git::validate_repo(Path::new(&repo_draft)) {
+                    self.set_log(e);
+                    return;
+                }
+            }
+            if let Err(e) = civ::validate_exe_override(&self.draft_exe) {
+                self.set_log(e);
+                return;
+            }
+            self.config.mod_repo_path = repo_draft;
             self.config.steam_app_id =
                 config::parse_app_id(&self.draft_app_id, self.config.steam_app_id);
             self.config.civ_exe_override = self.draft_exe.trim().to_string();
@@ -1154,6 +1661,11 @@ impl LauncherApp {
                 ui.label(egui::RichText::new(&self.update_status).small().weak());
             }
         });
+        ui.add_space(8.0);
+        // Way back: Settings replaces the whole pane.
+        if ui.button("Close").clicked() {
+            self.show_settings = false;
+        }
     }
 
     fn report_ui(&mut self, ctx: &egui::Context) {
@@ -1220,6 +1732,86 @@ impl LauncherApp {
                         );
                     }
                 }
+                // Guided gh setup: only appears once a submit discovers
+                // gh missing or unauthenticated.
+                match self.gh_flow {
+                    GhFlow::Idle => {}
+                    GhFlow::Missing => {
+                        ui.add_space(4.0);
+                        ui.label("GitHub CLI (gh) is not installed — it files the issue.");
+                        if !self.gh_message.is_empty() {
+                            ui.label(egui::RichText::new(&self.gh_message).small().color(ERR_RED));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Install gh")
+                                .on_hover_text("Install GitHub.cli via winget")
+                                .clicked()
+                            {
+                                self.spawn_gh_install();
+                            }
+                            if ui
+                                .button("Just open in browser")
+                                .on_hover_text("Skip gh: prefilled issue form instead")
+                                .clicked()
+                            {
+                                let body = self.build_report_body();
+                                let url =
+                                    report::issue_prefill_url(self.report_title.trim(), &body);
+                                match open::that(&url) {
+                                    Ok(()) => {
+                                        self.gh_flow = GhFlow::Idle;
+                                        self.report_result =
+                                            "opened prefilled issue in browser".to_string();
+                                    }
+                                    Err(e) => {
+                                        self.gh_message = format!("could not open browser: {e}");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    GhFlow::Installing => {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new(
+                                    "installing gh via winget… (approve any prompt)",
+                                )
+                                .weak(),
+                            );
+                        });
+                    }
+                    GhFlow::NeedsAuth => {
+                        ui.add_space(4.0);
+                        ui.label("gh is installed but not signed in (one-time).");
+                        if !self.gh_message.is_empty() {
+                            ui.label(egui::RichText::new(&self.gh_message).small().color(ERR_RED));
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "1. Click Authenticate — a terminal opens.\n\
+                                 2. Choose GitHub.com and log in with your browser.\n\
+                                 3. Finish there; submitting continues here automatically.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        if ui.button("Authenticate…").clicked() {
+                            self.spawn_gh_auth();
+                        }
+                    }
+                    GhFlow::Authing => {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("waiting for the sign-in terminal…").weak(),
+                            );
+                        });
+                    }
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let sending = self.report_sending;
@@ -1247,16 +1839,17 @@ impl LauncherApp {
                         ctx.copy_text(self.build_report_body());
                         self.report_result = "diagnostics copied to clipboard".to_string();
                     }
-                    let can_submit = !sending && !self.report_title.trim().is_empty();
+                    let gh_busy = matches!(self.gh_flow, GhFlow::Installing | GhFlow::Authing);
+                    let can_submit = !sending && !gh_busy && !self.report_title.trim().is_empty();
                     if ui
                         .add_enabled(can_submit, primary_button("Submit issue", can_submit))
                         .on_hover_text(
-                            "File on siegelh/DowagerMod via gh (browser fallback when gh is missing)",
+                            "File on siegelh/DowagerMod via gh (installs and signs in when needed)",
                         )
                         .clicked()
                     {
                         let title = self.report_title.trim().to_string();
-                        self.spawn_report(title, self.report_desc.clone());
+                        self.submit_or_setup_gh(title, self.report_desc.clone());
                     }
                     if sending {
                         ui.spinner();
@@ -1329,6 +1922,73 @@ impl LauncherApp {
             self.update_error.clear();
         }
     }
+
+    fn clone_ui(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_clone;
+        egui::Window::new("Checkout DowagerMod")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label("Destination:");
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(self.picking.is_none(), egui::Button::new("Browse…"))
+                            .on_hover_text("Pick an empty folder to clone into")
+                            .clicked()
+                        {
+                            self.spawn_pick(PickTarget::CloneDest);
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.clone_dest)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Clones {} (a first checkout downloads the whole history).",
+                        git::MOD_REPO_URL,
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if !self.clone_error.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("clone failed: {}", self.clone_error))
+                            .small()
+                            .color(ERR_RED),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    // In the empty state only the clone itself sets `busy`.
+                    let busy = self.busy.is_some() || self.deploying || self.git_missing;
+                    let can_clone = !busy && !self.clone_dest.trim().is_empty();
+                    if ui
+                        .add_enabled(can_clone, primary_button("Clone", can_clone))
+                        .clicked()
+                    {
+                        self.spawn_clone(self.clone_dest.trim().to_string());
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_clone = false;
+                    }
+                    if self.busy.is_some() {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("cloning…").weak());
+                    }
+                });
+            });
+        // A running clone owns `busy`, not the dialog: closing mid-clone
+        // leaves it running, and the result still applies on completion.
+        // AND, not assign: Cancel clears the field inside, and the X
+        // clears `open` — either one closes the dialog.
+        self.show_clone = open && self.show_clone;
+    }
 }
 
 #[cfg(test)]
@@ -1380,6 +2040,11 @@ mod tests {
     fn error_sniffing_flags_failures_only() {
         assert!(looks_like_error("fetch failed (offline?): nope"));
         assert!(looks_like_error("update failed: Permission denied"));
+        assert!(looks_like_error("install failed: winget is missing"));
+        assert!(looks_like_error("clone failed: destination already exists"));
+        assert!(looks_like_error(
+            "not a DowagerMod checkout (installer not found): C:\\x"
+        ));
         assert!(looks_like_error("git fetch timed out after 90s"));
         assert!(looks_like_error(
             "deploy refused: Civ4 is running — quit the game first"
@@ -1398,5 +2063,26 @@ mod tests {
         assert!(!looks_like_error(
             "Updating abc..def\nFast-forward\n error_handler.py | 2 +-"
         ));
+    }
+
+    #[test]
+    fn browse_start_dir_prefers_existing_dir_then_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // The draft itself when it exists.
+        assert_eq!(pick_start_dir(&root.to_string_lossy()), Some(root.clone()));
+        // Its parent when the draft is a file or a missing path.
+        let missing = root.join("nope").join("deeper");
+        assert_eq!(
+            pick_start_dir(&missing.to_string_lossy()),
+            None,
+            "missing parents fall through to the dialog default"
+        );
+        assert_eq!(
+            pick_start_dir(&root.join("file.exe").to_string_lossy()),
+            Some(root.clone())
+        );
+        assert_eq!(pick_start_dir(""), None);
+        assert_eq!(pick_start_dir("   "), None);
     }
 }

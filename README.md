@@ -33,26 +33,32 @@ Sid Meier's Civilization IV: Beyond the Sword mod — is installed on the system
   `steam://run/8800` fallback. The panel shows whether the live install
   matches the current checkout (compares `last_mod_version` with the
   checkout's `git describe`).
-- **Settings** — the mod repo path is configurable and persisted to
-  `%APPDATA%\DowagerMod-Launcher\config.json` (auto-detects a `DowagerMod`
-  folder next to the launcher otherwise).
+- **Settings** — the mod repo path is configurable (type it or Browse)
+  and persisted to `%APPDATA%\DowagerMod-Launcher\config.json`
+  (auto-detects a `DowagerMod` folder next to the launcher otherwise);
+  the Civ exe override also has a Browse button. Both paths are validated
+  on Save (repo must be a DowagerMod git checkout, exe must exist).
 - **Self-update** — on startup the launcher checks GitHub Releases for a
   newer build and offers to download, install, and restart into it (also
   re-checkable from Settings). Cutting a `v*` tag publishes a release via
   the release workflow.
+- **First-run setup** — when no checkout is found the UI offers Find
+  DowagerMod (pick the folder) or Checkout DowagerMod (clone fresh from
+  GitHub). Missing `git` is installed automatically via winget (banner +
+  retry on failure); missing `gh` is installed from the Report dialog,
+  which then walks through `gh auth login` in a terminal and submits
+  automatically once signed in.
 
 ## Prerequisites
 
-- Windows 10/11, 64-bit
+- Windows 10/11, 64-bit with `winget` (ships with Windows)
 - [Rust stable](https://rustup.rs/) (1.80+) with a linker:
   `winget install Rustlang.Rustup`, then install
   [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
   (Desktop development with C++), or use the `x86_64-pc-windows-gnu` toolchain
-- `git` on `PATH`
-- A DowagerMod checkout (sibling `DowagerMod` folder by default)
-- `gh` ([GitHub CLI](https://cli.github.com/), authenticated) for one-click
-  issue filing — optional; without it, Report bug opens a prefilled form in
-  the browser instead
+- `git` and `gh` are installed automatically on first use via winget
+  (`gh` also walks through its sign-in); a DowagerMod checkout is found
+  or cloned from the first-run screen, no manual setup needed
 
 ## Run / build
 

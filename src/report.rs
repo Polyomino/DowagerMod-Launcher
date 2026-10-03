@@ -496,7 +496,10 @@ pub fn submit_via_gh(title: &str, body: &str) -> Result<String, String> {
 }
 
 fn run_gh(bin: &str, args: &[String]) -> Result<String, String> {
-    let mut cmd = std::process::Command::new(bin);
+    // Resolved via the tool registry: a winget-installed `gh` is
+    // invisible to our PATH until restart (bogus test names pass
+    // through untouched — no override exists for them).
+    let mut cmd = std::process::Command::new(crate::setup::tool_path(bin));
     crate::git::hide_child_console(&mut cmd);
     let mut child = cmd
         .args(args)
