@@ -160,6 +160,16 @@ fn needs_checkout(current_branch: Option<&str>, target: &str) -> bool {
     current_branch != Some(target)
 }
 
+/// Settings update row: the launcher version always, plus the last
+/// check status once one exists (a status must never hide the version).
+fn update_row_text(version: &str, status: &str) -> String {
+    if status.is_empty() {
+        format!("launcher v{version}")
+    } else {
+        format!("launcher v{version} · {status}")
+    }
+}
+
 /// Error sniffing so failures stand out in the log line. Matches our
 /// own failure prefixes plus git's `error:`/`fatal:` markers — deliberately
 /// NOT bare substrings like "error", which also appear in success output
@@ -1651,15 +1661,14 @@ impl LauncherApp {
             {
                 self.spawn_update_check();
             }
-            if self.update_status.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("launcher v{}", update::local_version()))
-                        .small()
-                        .weak(),
-                );
-            } else {
-                ui.label(egui::RichText::new(&self.update_status).small().weak());
-            }
+            ui.label(
+                egui::RichText::new(update_row_text(
+                    &update::local_version(),
+                    &self.update_status,
+                ))
+                .small()
+                .weak(),
+            );
         });
         ui.add_space(8.0);
         // Way back: Settings replaces the whole pane.
@@ -2034,6 +2043,15 @@ mod tests {
         assert!(!needs_checkout(Some("main"), "main"));
         assert!(needs_checkout(Some("main"), "frost"));
         assert!(needs_checkout(None, "frost"));
+    }
+
+    #[test]
+    fn update_row_always_lists_version() {
+        assert_eq!(update_row_text("0.2.1", ""), "launcher v0.2.1");
+        assert_eq!(
+            update_row_text("0.2.1", "up to date"),
+            "launcher v0.2.1 · up to date"
+        );
     }
 
     #[test]
