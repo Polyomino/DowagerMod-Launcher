@@ -1,0 +1,6 @@
+/target/
+# NOTE: Cargo.lock is intentionally committed (binary crate → reproducible builds).
+*.pdb
+/dist/
+# Local-only shortcut (contains an absolute path to this machine's dist/).
+/*.lnk
