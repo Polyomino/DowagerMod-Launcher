@@ -45,6 +45,16 @@ pub struct RepoStatus {
 /// never wedge on `busy` forever.
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// First `max` chars + "…" when longer (char-boundary safe).
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 /// Keep child consoles from flashing: without `CREATE_NO_WINDOW` every
 /// `git` spawn pops a visible console window from this GUI app.
 #[cfg(windows)]
@@ -99,6 +109,21 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
             Ok(Some(status)) => {
                 let out = out_thread.join().unwrap_or_default();
                 let err = err_thread.join().unwrap_or_default();
+                // Trace every invocation for the session log (failures
+                // carry their stderr so post-mortems have the real error).
+                let detail = if status.success() {
+                    String::new()
+                } else {
+                    let err = String::from_utf8_lossy(&err).trim().to_string();
+                    format!(" | {}", truncate(&err, 300))
+                };
+                crate::log::append(&format!(
+                    "git {} (in {}) -> {} in {:.1}s{detail}",
+                    args.join(" "),
+                    repo.display(),
+                    if status.success() { "ok" } else { "FAILED" },
+                    start.elapsed().as_secs_f32()
+                ));
                 if status.success() {
                     return Ok(String::from_utf8_lossy(&out).trim().to_string());
                 }
@@ -109,6 +134,12 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
                     let _ = child.kill();
                     let _ = child.wait();
                     let what = args.first().unwrap_or(&"?");
+                    crate::log::append(&format!(
+                        "git {} (in {}) -> TIMEOUT after {}s",
+                        args.join(" "),
+                        repo.display(),
+                        GIT_TIMEOUT.as_secs()
+                    ));
                     return Err(format!(
                         "git {what} timed out after {}s",
                         GIT_TIMEOUT.as_secs()
@@ -552,6 +583,14 @@ mod tests {
             ..base
         };
         assert!(distance_text(&detached).contains("detached"));
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings_whole() {
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abcdef", 5), "abcde…");
+        // Multibyte chars are never split mid-codepoint.
+        assert_eq!(truncate("aé—c", 2), "aé…");
     }
 
     #[test]

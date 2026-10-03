@@ -97,6 +97,11 @@ fn move_selection(selected: usize, count: usize, down: bool) -> (usize, bool) {
     (next, next != selected)
 }
 
+/// Checkout is a no-op when already on the target branch.
+fn needs_checkout(current_branch: Option<&str>, target: &str) -> bool {
+    current_branch != Some(target)
+}
+
 /// Error sniffing so failures stand out in the log line. Matches our
 /// own failure prefixes plus git's `error:`/`fatal:` markers — deliberately
 /// NOT bare substrings like "error", which also appear in success output
@@ -122,6 +127,7 @@ fn looks_like_error(log: &str) -> bool {
         "no remote tip",
         "not on a branch",
         "no mod checkout",
+        "already running",
     ]
     .iter()
     .any(|k| lower.contains(k))
@@ -165,6 +171,20 @@ fn branch_row_job(b: &BranchInfo, age: &str, ui: &egui::Ui) -> egui::text::Layou
             ..Default::default()
         },
     );
+    if b.is_current {
+        // Bronze name alone is subtle: tag it so the checkout stands out
+        // wherever it sits in newest-first order.
+        job.append(
+            "  [current]",
+            0.0,
+            TextFormat {
+                font_id: egui::FontId::proportional(12.0),
+                color: weak,
+                italics: true,
+                ..Default::default()
+            },
+        );
+    }
     if b.remote_only {
         job.append(
             "  [remote]",
@@ -199,6 +219,9 @@ pub struct LauncherApp {
     /// the list scrolls to the row exactly once, then this clears. Mouse
     /// scrolling never sets it, so the view can't snap back mid-scroll.
     scroll_to_selected: bool,
+    /// Set when a checkout completes: the follow-up refresh selects the
+    /// new current branch and scrolls it into view.
+    scroll_to_current: bool,
     /// An installer child is running: no second deploy, no launch, and no
     /// git jobs (the payload must not change mid-install).
     deploying: bool,
@@ -233,6 +256,7 @@ impl LauncherApp {
             focused_search: false,
             job_epoch: 0,
             scroll_to_selected: false,
+            scroll_to_current: false,
             deploying: false,
             live_match: civ::LiveMatch::Unknown,
             tx,
@@ -243,14 +267,14 @@ impl LauncherApp {
         if let Some(repo) = app.repo.clone() {
             match git::status(&repo, false) {
                 Ok(st) => app.status = Some(st),
-                Err(e) => app.log = e,
+                Err(e) => app.set_log(e),
             }
             if let Ok(list) = git::branches(&repo) {
                 app.branches = list;
             }
             app.spawn_refresh(true);
         } else {
-            app.log = "DowagerMod checkout not found — set the path in Settings.".to_string();
+            app.set_log("DowagerMod checkout not found — set the path in Settings.".to_string());
             app.show_settings = true;
         }
         app
@@ -306,21 +330,30 @@ impl LauncherApp {
             return;
         }
         let Some(repo) = self.repo.clone() else {
-            self.log = "no mod checkout configured".to_string();
+            self.set_log("no mod checkout configured".to_string());
+            return;
+        };
+        // Cross-process single-flight first: a second launcher window may
+        // be mid-deploy (the in-process `deploying` flag can't see it).
+        let Some(lock) = civ::acquire_deploy_lock() else {
+            self.set_log(
+                "installer already running in another window — wait for it to finish".to_string(),
+            );
             return;
         };
         match civ::deploy(&repo) {
             Ok(child) => {
                 self.deploying = true;
-                self.log = "installer started (approve the UAC prompt)".to_string();
+                self.set_log("installer started (approve the UAC prompt)".to_string());
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     let mut child = child;
                     let _ = child.wait();
+                    drop(lock);
                     let _ = tx.send(JobOut::Deployed);
                 });
             }
-            Err(e) => self.log = e,
+            Err(e) => self.set_log(e),
         }
     }
 
@@ -345,53 +378,67 @@ impl LauncherApp {
                     self.status = Some(st);
                     self.branches = list;
                     self.live_match = live;
-                    self.selected = keep
+                    let fallback = keep
                         .and_then(|name| self.filtered().iter().position(|b| b.name == name))
                         .unwrap_or(0);
+                    if self.scroll_to_current {
+                        self.scroll_to_current = false;
+                        // Follow the fresh checkout; if a filter hides the
+                        // current branch, keep the old selection instead.
+                        if let Some(i) = self.filtered().iter().position(|b| b.is_current) {
+                            self.selected = i;
+                            self.scroll_to_selected = true;
+                        } else {
+                            self.selected = fallback;
+                        }
+                    } else {
+                        self.selected = fallback;
+                    }
                     self.busy = None;
                 }
                 JobOut::Refreshed(epoch, Err(e)) => {
                     if epoch != self.job_epoch {
                         continue; // stale: orphaned by a newer spawn
                     }
-                    self.log = format!("refresh failed: {e}");
+                    self.set_log(format!("refresh failed: {e}"));
                     self.busy = None;
                 }
                 JobOut::Updated(epoch, Ok(out)) => {
                     if epoch != self.job_epoch {
                         continue;
                     }
-                    self.log = if out.is_empty() {
+                    self.set_log(if out.is_empty() {
                         "already up to date".to_string()
                     } else {
                         out
-                    };
+                    });
                     self.spawn_refresh(false);
                 }
                 JobOut::Updated(epoch, Err(e)) => {
                     if epoch != self.job_epoch {
                         continue;
                     }
-                    self.log = format!("update failed: {e}");
+                    self.set_log(format!("update failed: {e}"));
                     self.busy = None;
                 }
                 JobOut::CheckedOut(epoch, Ok(_)) => {
                     if epoch != self.job_epoch {
                         continue;
                     }
-                    self.log = "branch switched".to_string();
+                    self.set_log("branch switched".to_string());
+                    self.scroll_to_current = true;
                     self.spawn_refresh(false);
                 }
                 JobOut::CheckedOut(epoch, Err(e)) => {
                     if epoch != self.job_epoch {
                         continue;
                     }
-                    self.log = format!("switch failed: {e}");
+                    self.set_log(format!("switch failed: {e}"));
                     self.busy = None;
                 }
                 JobOut::Deployed => {
                     self.deploying = false;
-                    self.log = "installer window closed".to_string();
+                    self.set_log("installer window closed".to_string());
                     // Recompute the live-match line (deploy rewrote it).
                     self.spawn_refresh(false);
                 }
@@ -403,6 +450,12 @@ impl LauncherApp {
         git::filter_branches(&self.branches, &self.search)
     }
 
+    /// Status line for the UI bar, mirrored to the session log file.
+    fn set_log(&mut self, msg: String) {
+        crate::log::append(&msg);
+        self.log = msg;
+    }
+
     fn checkout_selected(&mut self) {
         // Enter/double-click bypass the disabled-button gate, so guard here:
         // overlapping git jobs fight over the repo lock, and the payload
@@ -411,6 +464,11 @@ impl LauncherApp {
             return;
         }
         if let Some(b) = self.filtered().get(self.selected).map(|b| b.name.clone()) {
+            let current = self.status.as_ref().map(|s| s.branch.as_str());
+            if !needs_checkout(current, &b) {
+                self.set_log(format!("already on {b}"));
+                return;
+            }
             self.spawn_checkout(b);
         }
     }
@@ -429,41 +487,60 @@ impl eframe::App for LauncherApp {
         if self.busy.is_some() || self.deploying {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+        // Global refresh hotkey (mirrors the header button's gate).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R))
+            && self.busy.is_none()
+            && !self.deploying
+            && self.repo.is_some()
+        {
+            self.spawn_refresh(true);
+        }
 
+        // No in-app title: the OS window chrome already says it.
+        // Header is just context (folder name) plus global actions.
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("DowagerMod Launcher")
-                        .size(22.0)
-                        .strong(),
-                );
+                match &self.repo {
+                    Some(repo) => {
+                        let folder = repo
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| repo.to_string_lossy().to_string());
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(folder).size(15.0).strong())
+                                .truncate(),
+                        )
+                        .on_hover_text(repo.to_string_lossy());
+                    }
+                    None => {
+                        let configured = self.config.mod_repo_path.trim();
+                        let msg = if configured.is_empty() {
+                            "mod checkout not found — set the path in Settings".to_string()
+                        } else {
+                            format!("configured mod path not found: {configured}")
+                        };
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(msg).color(WARN_AMBER)).truncate(),
+                        );
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.show_settings = !self.show_settings;
                     }
+                    // Refresh lives here (not in Branches): it refreshes
+                    // status, branches, and the live-match line together.
+                    let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Refresh"))
+                        .on_hover_text("Refresh status and branches (Ctrl+R)")
+                        .clicked()
+                    {
+                        self.spawn_refresh(true);
+                    }
                 });
             });
-            ui.add_space(2.0);
-            match &self.repo {
-                Some(repo) => {
-                    ui.label(
-                        egui::RichText::new(format!("mod: {}", repo.to_string_lossy()))
-                            .monospace()
-                            .small()
-                            .weak(),
-                    );
-                }
-                None => {
-                    let configured = self.config.mod_repo_path.trim();
-                    let msg = if configured.is_empty() {
-                        "mod checkout not found — set the path in Settings".to_string()
-                    } else {
-                        format!("configured mod path not found: {configured}")
-                    };
-                    ui.label(egui::RichText::new(msg).color(WARN_AMBER));
-                }
-            }
             ui.add_space(4.0);
         });
 
@@ -568,10 +645,23 @@ impl LauncherApp {
                                     .color(WARN_AMBER),
                             );
                         }
+                        // Full path lives here (not the header): visible
+                        // when debugging a wrong repo, quiet otherwise.
+                        if let Some(repo) = &self.repo {
+                            ui.label(
+                                egui::RichText::new(format!("repo: {}", repo.display()))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
                     });
             }
             None => {
-                ui.label(egui::RichText::new("no status yet").weak());
+                if self.repo.is_none() {
+                    ui.label(egui::RichText::new("no checkout configured — open Settings").weak());
+                } else {
+                    ui.label(egui::RichText::new("no status yet").weak());
+                }
             }
         }
         ui.add_space(6.0);
@@ -584,6 +674,7 @@ impl LauncherApp {
             let enabled = self.busy.is_none() && !self.deploying && can_update;
             if ui
                 .add_enabled(enabled, primary_button("Update to latest", enabled))
+                .on_hover_text("Fast-forward this branch to its remote tip")
                 .clicked()
             {
                 self.spawn_update();
@@ -677,15 +768,10 @@ impl LauncherApp {
             let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
             if ui
                 .add_enabled(!busy, egui::Button::new("Switch to selected"))
+                .on_hover_text("Check out the selected branch (Enter)")
                 .clicked()
             {
                 self.checkout_selected();
-            }
-            if ui
-                .add_enabled(!busy, egui::Button::new("Refresh"))
-                .clicked()
-            {
-                self.spawn_refresh(true);
             }
         });
     }
@@ -764,17 +850,19 @@ impl LauncherApp {
                     can_launch,
                     primary_button("Launch Civ4 with DowagerMod", can_launch),
                 )
+                .on_hover_text("Start Civilization IV with the deployed mod")
                 .on_disabled_hover_text("installer is running — close its window first")
                 .clicked()
             {
                 match civ::launch(&plan) {
-                    Ok(msg) => self.log = msg,
-                    Err(e) => self.log = e,
+                    Ok(msg) => self.set_log(msg),
+                    Err(e) => self.set_log(e),
                 }
             }
             let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
             if ui
                 .add_enabled(!busy, egui::Button::new("Deploy to Civ4"))
+                .on_hover_text("Run Install DowagerMod.bat (UAC prompt appears)")
                 .clicked()
             {
                 self.spawn_deploy();
@@ -830,8 +918,8 @@ impl LauncherApp {
                 config::parse_app_id(&self.draft_app_id, self.config.steam_app_id);
             self.config.civ_exe_override = self.draft_exe.trim().to_string();
             match self.config.save() {
-                Ok(()) => self.log = "settings saved".to_string(),
-                Err(e) => self.log = format!("save failed: {e}"),
+                Ok(()) => self.set_log("settings saved".to_string()),
+                Err(e) => self.set_log(format!("save failed: {e}")),
             }
             self.repo = self.config.repo_path();
             // Orphan anything still in flight (defensive: Save is gated,
@@ -848,6 +936,28 @@ impl LauncherApp {
             }
             self.spawn_refresh(true);
         }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Open log file")
+                .on_hover_text("Open launcher.log in the default text viewer")
+                .clicked()
+            {
+                match crate::log::path() {
+                    Some(path) => {
+                        if let Err(e) = open::that(&path) {
+                            self.set_log(format!("failed to open log: {e}"));
+                        }
+                    }
+                    None => self.set_log("no log dir on this machine".to_string()),
+                }
+            }
+            ui.label(
+                egui::RichText::new("session log with every git command + result")
+                    .small()
+                    .weak(),
+            );
+        });
     }
 }
 
@@ -890,6 +1000,13 @@ mod tests {
     }
 
     #[test]
+    fn checkout_skips_current_branch() {
+        assert!(!needs_checkout(Some("main"), "main"));
+        assert!(needs_checkout(Some("main"), "frost"));
+        assert!(needs_checkout(None, "frost"));
+    }
+
+    #[test]
     fn error_sniffing_flags_failures_only() {
         assert!(looks_like_error("fetch failed (offline?): nope"));
         assert!(looks_like_error("update failed: Permission denied"));
@@ -899,6 +1016,9 @@ mod tests {
         ));
         assert!(looks_like_error("not a git checkout: C:\\nope"));
         assert!(looks_like_error("error: cannot open '.git/FETCH_HEAD'"));
+        assert!(looks_like_error(
+            "installer already running in another window — wait for it to finish"
+        ));
         assert!(!looks_like_error("already up to date"));
         assert!(!looks_like_error("branch switched"));
         assert!(!looks_like_error("settings saved"));

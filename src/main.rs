@@ -5,10 +5,12 @@ mod app;
 mod civ;
 mod config;
 mod git;
+mod log;
 
 use app::LauncherApp;
 
 fn main() -> eframe::Result<()> {
+    log::start_session();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // Tall enough for header + status card + full branch list +

@@ -16,6 +16,8 @@ const INSTALLER_CONFIG_RELATIVE: [&str; 2] = ["DowagerMod", "config.json"];
 /// Image name of the running game process (for the deploy guard).
 const GAME_EXE_NAME: &str = "Civ4BeyondSword.exe";
 const GAME_EXE_NAME_LOWER: &str = "civ4beyondsword.exe";
+/// Cross-process deploy mutex: held open for the whole install.
+const DEPLOY_LOCK_NAME: &str = "DowagerMod-Launcher.deploy.lock";
 
 /// How the game will be launched (shown in the UI before launching).
 #[derive(Debug, Clone)]
@@ -228,6 +230,33 @@ fn tasklist_shows_exe(output: &str) -> bool {
     output.to_lowercase().contains(GAME_EXE_NAME_LOWER)
 }
 
+#[cfg(windows)]
+fn exclusive_open(opts: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // share_mode(0): no other opener — not even this process — while held.
+    // The OS releases it on crash, so the lock can never go stale.
+    opts.share_mode(0);
+}
+
+#[cfg(not(windows))]
+fn exclusive_open(_opts: &mut std::fs::OpenOptions) {}
+
+/// Cross-process deploy lock, held open for the install duration.
+/// Dropping it releases. A failed acquire means another launcher window
+/// is mid-deploy (a crash can't wedge it: the OS frees the handle).
+pub(crate) struct DeployLock {
+    _held: std::fs::File,
+}
+
+/// Try to take the deploy lock. At most one holder machine-wide.
+pub(crate) fn acquire_deploy_lock() -> Option<DeployLock> {
+    let path = std::env::temp_dir().join(DEPLOY_LOCK_NAME);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    exclusive_open(&mut opts);
+    opts.open(path).ok().map(|f| DeployLock { _held: f })
+}
+
 /// Deploy the mod: run `Install DowagerMod.bat` (self-elevates via UAC),
 /// falling back to the installer exe when the bat is missing. Refuses
 /// while the game runs. Returns the child process so the caller can wait
@@ -246,9 +275,12 @@ pub fn deploy(repo: &Path) -> Result<Child, String> {
         return Err("deploy refused: Civ4 is running — quit the game first".to_string());
     }
     if use_bat {
+        // Pass the path unquoted: Rust quotes it exactly once for cmd.
+        // (Pre-quoting here gets escaped a second time, and cmd then
+        // fails to find the bat at all.)
         std::process::Command::new("cmd")
             .arg("/C")
-            .arg(format!("\"{}\"", bat.display()))
+            .arg(&bat)
             .current_dir(repo)
             .spawn()
             .map_err(|e| format!("failed to start installer: {e}"))
@@ -283,6 +315,35 @@ mod tests {
         );
     }
 
+    /// Deploy must survive spaces: the bat name itself
+    /// (`Install DowagerMod.bat`) has them, so quoting has to be right
+    /// even for space-free repo dirs.
+    #[cfg(windows)]
+    #[test]
+    fn deploy_runs_bat_with_spaces_in_path() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("dir with spaces");
+        std::fs::create_dir(&repo).unwrap();
+        let marker = repo.join("deployed.marker");
+        std::fs::write(
+            repo.join("Install DowagerMod.bat"),
+            format!("@echo off\r\necho ok > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        let mut child = deploy(&repo).expect("deploy spawns");
+        let mut waited = 0;
+        while !marker.is_file() && waited < 100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            waited += 1;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            marker.is_file(),
+            "bat with spaces in path never ran (quoting bug?)"
+        );
+    }
+
     #[test]
     fn tasklist_parse_spots_running_game() {
         assert_eq!(GAME_EXE_NAME.to_lowercase(), GAME_EXE_NAME_LOWER);
@@ -296,6 +357,23 @@ mod tests {
             "INFO: No tasks are running which match the specified criteria."
         ));
         assert!(!tasklist_shows_exe(""));
+    }
+
+    #[test]
+    fn deploy_lock_single_flight() {
+        let held = acquire_deploy_lock().expect("first acquire succeeds");
+        #[cfg(windows)]
+        {
+            assert!(
+                acquire_deploy_lock().is_none(),
+                "second acquire refused while held"
+            );
+        }
+        drop(held);
+        assert!(
+            acquire_deploy_lock().is_some(),
+            "re-acquire succeeds after release"
+        );
     }
 
     #[test]

@@ -13,10 +13,15 @@ Sid Meier's Civilization IV: Beyond the Sword mod — is installed on the system
 - **Branch list** — all local and remote branches ordered by latest commit
   time, with a keyboard-navigable filter (type to filter, `Up`/`Down` to
   move, `Enter` to switch, double-click also switches).
+- **Session log** — every status line plus every git invocation (with
+  timing and failure output) is appended to
+  `%LOCALAPPDATA%\DowagerMod-Launcher\launcher.log` (rotates past 1 MB);
+  open it from the Settings panel.
 - **Deploy to Civ4** — runs `Install DowagerMod.bat` from the checkout
   (UAC prompt appears; required after pulling, since `git pull` alone does
   not touch the live game install). Refuses while Civ4 is running, and
-  blocks second deploys, launches, and git jobs until the installer ends.
+  blocks second deploys (even from another launcher window), launches,
+  and git jobs until the installer ends.
 - **Launch Civ4 with DowagerMod** — starts the live
   `Beyond the Sword\Civ4BeyondSword.exe` detected via the installer's
   `%LOCALAPPDATA%\DowagerMod\config.json`, a Steam library scan, or the
