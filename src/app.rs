@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::LauncherConfig;
 use crate::git::{self, BranchInfo, RepoStatus};
-use crate::{civ, config};
+use crate::{civ, config, report};
 
 /// Warm bronze accent — Civ-appropriate, and deliberately not the
 /// purple/blue default.
@@ -33,6 +33,9 @@ enum JobOut {
     /// Installer child process exited (deploy cannot overlap anything,
     /// so no epoch is needed).
     Deployed,
+    /// Bug-report submit finished: issue URL / fallback note, or a reason.
+    /// Independent of repo switches (it files a snapshot), so no epoch.
+    Reported(Result<String, String>),
 }
 
 /// One-time theme setup: bronze selection, roomier spacing.
@@ -114,6 +117,7 @@ fn looks_like_error(log: &str) -> bool {
         "switch failed",
         "refresh failed",
         "fetch failed",
+        "report failed",
         "save failed",
         "failed to ",
         "failed:",
@@ -226,6 +230,12 @@ pub struct LauncherApp {
     /// git jobs (the payload must not change mid-install).
     deploying: bool,
     live_match: civ::LiveMatch,
+    show_report: bool,
+    report_title: String,
+    report_desc: String,
+    report_preview: Option<String>,
+    report_sending: bool,
+    report_result: String,
     tx: Sender<JobOut>,
     rx: Receiver<JobOut>,
 }
@@ -259,6 +269,12 @@ impl LauncherApp {
             scroll_to_current: false,
             deploying: false,
             live_match: civ::LiveMatch::Unknown,
+            show_report: false,
+            report_title: String::new(),
+            report_desc: String::new(),
+            report_preview: None,
+            report_sending: false,
+            report_result: String::new(),
             tx,
             rx,
         };
@@ -357,6 +373,42 @@ impl LauncherApp {
         }
     }
 
+    fn spawn_report(&mut self, title: String, desc: String) {
+        if self.report_sending {
+            return;
+        }
+        self.report_sending = true;
+        self.report_result.clear();
+        let repo = self.repo.clone();
+        let live = self.live_match;
+        let cfg = self.config.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let sections = report::collect(repo.as_deref(), live, &cfg);
+            let body = report::render_markdown(&desc, &sections);
+            let outcome = match report::submit_via_gh(&title, &body) {
+                Ok(url) => Ok(format!("issue filed: {url}")),
+                Err(e) => {
+                    // Fallback: a prefilled browser form, one review + click.
+                    let url = report::issue_prefill_url(&title, &body);
+                    match open::that(&url) {
+                        Ok(()) => Ok(format!(
+                            "gh unavailable ({e}) — opened prefilled issue in browser"
+                        )),
+                        Err(be) => Err(format!("{e} (browser fallback also failed: {be})")),
+                    }
+                }
+            };
+            let _ = tx.send(JobOut::Reported(outcome));
+        });
+    }
+
+    /// Synchronous collect + render for Preview / Copy (local-only, fast).
+    fn build_report_body(&self) -> String {
+        let sections = report::collect(self.repo.as_deref(), self.live_match, &self.config);
+        report::render_markdown(&self.report_desc, &sections)
+    }
+
     fn poll_jobs(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
             match job {
@@ -441,6 +493,16 @@ impl LauncherApp {
                     self.set_log("installer window closed".to_string());
                     // Recompute the live-match line (deploy rewrote it).
                     self.spawn_refresh(false);
+                }
+                JobOut::Reported(Ok(msg)) => {
+                    self.report_sending = false;
+                    self.report_result = msg.clone();
+                    self.set_log(msg);
+                }
+                JobOut::Reported(Err(e)) => {
+                    self.report_sending = false;
+                    self.set_log(format!("report failed: {e}"));
+                    self.report_result = format!("report failed: {e}");
                 }
             }
         }
@@ -539,6 +601,14 @@ impl eframe::App for LauncherApp {
                     {
                         self.spawn_refresh(true);
                     }
+                    if ui
+                        .button("Report bug")
+                        .on_hover_text("File a GitHub issue with redacted diagnostics")
+                        .clicked()
+                    {
+                        self.report_result.clear();
+                        self.show_report = true;
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -588,6 +658,15 @@ impl eframe::App for LauncherApp {
                     ui.add_space(6.0);
                 });
         });
+
+        if self.show_report {
+            // Repaint while sending so the spinner animates; result
+            // arrival repaints via the mpsc poll anyway.
+            if self.report_sending {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            self.report_ui(ctx);
+        }
     }
 }
 
@@ -958,6 +1037,117 @@ impl LauncherApp {
                     .weak(),
             );
         });
+    }
+
+    fn report_ui(&mut self, ctx: &egui::Context) {
+        // Local copy: `Window::open` needs `&mut bool`, which can't
+        // borrow the field while the contents closure borrows `self`.
+        let mut open = self.show_report;
+        egui::Window::new("Report bug")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label("Title:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.report_title)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("crash when …"),
+                );
+                ui.add_space(4.0);
+                ui.label("What happened:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.report_desc)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("steps, what you expected, what you saw"),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Diagnostics (mod version, installer config, launcher + Civ4 log tails) \
+                         attach automatically with paths, host, and IPs redacted.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if let Some(preview) = &self.report_preview {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(preview).monospace().small());
+                        });
+                }
+                if !self.report_result.is_empty() {
+                    ui.add_space(4.0);
+                    if let Some(url) = self
+                        .report_result
+                        .strip_prefix("issue filed: ")
+                        .map(str::trim)
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label("issue filed:");
+                            ui.hyperlink(url);
+                        });
+                    } else {
+                        let color = if looks_like_error(&self.report_result) {
+                            ERR_RED
+                        } else {
+                            OK_GREEN
+                        };
+                        ui.label(
+                            egui::RichText::new(&self.report_result)
+                                .small()
+                                .color(color),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let sending = self.report_sending;
+                    let preview_label = if self.report_preview.is_some() {
+                        "Hide preview"
+                    } else {
+                        "Preview diagnostics"
+                    };
+                    if ui
+                        .add_enabled(!sending, egui::Button::new(preview_label))
+                        .on_hover_text("Review exactly what gets attached")
+                        .clicked()
+                    {
+                        if self.report_preview.is_some() {
+                            self.report_preview = None;
+                        } else {
+                            self.report_preview = Some(self.build_report_body());
+                        }
+                    }
+                    if ui
+                        .button("Copy diagnostics")
+                        .on_hover_text("Copy the full report body to the clipboard")
+                        .clicked()
+                    {
+                        ctx.copy_text(self.build_report_body());
+                        self.report_result = "diagnostics copied to clipboard".to_string();
+                    }
+                    let can_submit = !sending && !self.report_title.trim().is_empty();
+                    if ui
+                        .add_enabled(can_submit, primary_button("Submit issue", can_submit))
+                        .on_hover_text(
+                            "File on siegelh/DowagerMod via gh (browser fallback when gh is missing)",
+                        )
+                        .clicked()
+                    {
+                        let title = self.report_title.trim().to_string();
+                        self.spawn_report(title, self.report_desc.clone());
+                    }
+                    if sending {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("filing issue…").weak());
+                    }
+                });
+            });
+        self.show_report = open;
     }
 }
 

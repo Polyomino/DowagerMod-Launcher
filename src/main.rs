@@ -6,6 +6,7 @@ mod civ;
 mod config;
 mod git;
 mod log;
+mod report;
 
 use app::LauncherApp;
 

@@ -17,6 +17,11 @@ Sid Meier's Civilization IV: Beyond the Sword mod — is installed on the system
   timing and failure output) is appended to
   `%LOCALAPPDATA%\DowagerMod-Launcher\launcher.log` (rotates past 1 MB);
   open it from the Settings panel.
+- **Report bug** — files a GitHub issue on
+  [DowagerMod](https://github.com/siegelh/DowagerMod) with auto-collected
+  diagnostics (mod version, installer config, launcher + Civ4 log tails)
+  redacted of paths, host, and IP addresses. Submits via the `gh` CLI, or
+  opens a prefilled browser form when `gh` is missing.
 - **Deploy to Civ4** — runs `Install DowagerMod.bat` from the checkout
   (UAC prompt appears; required after pulling, since `git pull` alone does
   not touch the live game install). Refuses while Civ4 is running, and
@@ -41,6 +46,9 @@ Sid Meier's Civilization IV: Beyond the Sword mod — is installed on the system
   (Desktop development with C++), or use the `x86_64-pc-windows-gnu` toolchain
 - `git` on `PATH`
 - A DowagerMod checkout (sibling `DowagerMod` folder by default)
+- `gh` ([GitHub CLI](https://cli.github.com/), authenticated) for one-click
+  issue filing — optional; without it, Report bug opens a prefilled form in
+  the browser instead
 
 ## Run / build
 

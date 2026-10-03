@@ -37,12 +37,22 @@ impl std::fmt::Display for LaunchPlan {
 
 /// Read `%LOCALAPPDATA%\DowagerMod\config.json` written by the installer.
 fn installer_config() -> Option<serde_json::Value> {
+    serde_json::from_str(&installer_config_text()?).ok()
+}
+
+/// Raw installer config text, for bug reports (the caller redacts it).
+pub fn installer_config_text() -> Option<String> {
     let dir = dirs::data_local_dir()?;
     let path = INSTALLER_CONFIG_RELATIVE
         .iter()
         .fold(dir, |p, part| p.join(part));
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    std::fs::read_to_string(path).ok()
+}
+
+/// Civ4 Beyond the Sword log folder
+/// (`Documents\My Games\Beyond the Sword\Logs`).
+pub fn civ_log_dir() -> Option<PathBuf> {
+    dirs::document_dir().map(|d| d.join("My Games").join("Beyond the Sword").join("Logs"))
 }
 
 /// Live Civ4 install dir remembered by the installer, if any.
@@ -374,6 +384,20 @@ mod tests {
             acquire_deploy_lock().is_some(),
             "re-acquire succeeds after release"
         );
+    }
+
+    #[test]
+    fn report_paths_stay_well_formed() {
+        if let Some(dir) = civ_log_dir() {
+            assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("Logs"));
+        }
+        // Read-only probe: present on dev machines, absent on CI.
+        if let Some(text) = installer_config_text() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                "installer config must stay valid JSON"
+            );
+        }
     }
 
     #[test]
