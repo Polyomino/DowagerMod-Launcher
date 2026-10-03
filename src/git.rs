@@ -48,14 +48,14 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Keep child consoles from flashing: without `CREATE_NO_WINDOW` every
 /// `git` spawn pops a visible console window from this GUI app.
 #[cfg(windows)]
-fn hide_child_console(cmd: &mut Command) {
+pub(crate) fn hide_child_console(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn hide_child_console(_cmd: &mut Command) {}
+pub(crate) fn hide_child_console(_cmd: &mut Command) {}
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     use std::io::Read;
@@ -116,7 +116,12 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("failed to wait on git: {e}")),
+            Err(e) => {
+                // Don't orphan the child on a wait failure.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to wait on git: {e}"));
+            }
         }
     }
 }
@@ -126,6 +131,14 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// never raised: the UI keeps the last-known status and shows the error.
 pub fn fetch(repo: &Path) -> Result<(), String> {
     git(repo, &["fetch", "--prune", "--quiet"]).map(|_| ())
+}
+
+/// `git describe --tags --always --dirty`: the same version string
+/// `install.py` records as `last_mod_version`, so the two are comparable.
+/// `"unknown"` when unavailable (mirrors the installer's fallback).
+pub fn describe(repo: &Path) -> String {
+    git(repo, &["describe", "--tags", "--always", "--dirty"])
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Current branch name, or `None` when HEAD is detached.

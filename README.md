@@ -15,11 +15,14 @@ Sid Meier's Civilization IV: Beyond the Sword mod — is installed on the system
   move, `Enter` to switch, double-click also switches).
 - **Deploy to Civ4** — runs `Install DowagerMod.bat` from the checkout
   (UAC prompt appears; required after pulling, since `git pull` alone does
-  not touch the live game install).
+  not touch the live game install). Refuses while Civ4 is running, and
+  blocks second deploys, launches, and git jobs until the installer ends.
 - **Launch Civ4 with DowagerMod** — starts the live
   `Beyond the Sword\Civ4BeyondSword.exe` detected via the installer's
   `%LOCALAPPDATA%\DowagerMod\config.json`, a Steam library scan, or the
-  `steam://run/8800` fallback.
+  `steam://run/8800` fallback. The panel shows whether the live install
+  matches the current checkout (compares `last_mod_version` with the
+  checkout's `git describe`).
 - **Settings** — the mod repo path is configurable and persisted to
   `%APPDATA%\DowagerMod-Launcher\config.json` (auto-detects a `DowagerMod`
   folder next to the launcher otherwise).

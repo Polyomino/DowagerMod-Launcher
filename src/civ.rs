@@ -5,6 +5,7 @@
 //! means launching the live `Civ4BeyondSword.exe`.
 
 use std::path::{Path, PathBuf};
+use std::process::Child;
 
 /// Exe path inside the live install dir (see `CoreFiles/install.py`).
 const EXE_RELATIVE: [&str; 2] = ["Beyond the Sword", "Civ4BeyondSword.exe"];
@@ -12,6 +13,9 @@ const EXE_RELATIVE: [&str; 2] = ["Beyond the Sword", "Civ4BeyondSword.exe"];
 const SENTINEL_NAME: &str = "_DOWAGERMOD_INSTALLED.txt";
 /// Installer state written by `CoreFiles/install.py`.
 const INSTALLER_CONFIG_RELATIVE: [&str; 2] = ["DowagerMod", "config.json"];
+/// Image name of the running game process (for the deploy guard).
+const GAME_EXE_NAME: &str = "Civ4BeyondSword.exe";
+const GAME_EXE_NAME_LOWER: &str = "civ4beyondsword.exe";
 
 /// How the game will be launched (shown in the UI before launching).
 #[derive(Debug, Clone)]
@@ -55,6 +59,49 @@ pub fn last_deployed_version() -> Option<String> {
         .get("last_mod_version")?
         .as_str()
         .map(str::to_string)
+}
+
+/// ISO timestamp recorded by the last installer run, if any.
+pub fn last_deployed_at() -> Option<String> {
+    installer_config()?
+        .get("last_install_at")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether the live install matches the current checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveMatch {
+    /// No deployed version recorded (or unreadable on either side).
+    Unknown,
+    /// Deployed version string equals the checkout's `git describe`.
+    Matches,
+    /// Anything else: update/switch happened since, or tags moved.
+    Differs,
+}
+
+/// Compare the installer's recorded version against the checkout's
+/// current `git describe` (the same command `install.py` uses).
+pub fn live_match(repo: &Path) -> LiveMatch {
+    match_versions(
+        last_deployed_version().as_deref(),
+        &crate::git::describe(repo),
+    )
+}
+
+/// Pure comparison behind [`live_match`], for unit tests.
+pub fn match_versions(deployed: Option<&str>, current: &str) -> LiveMatch {
+    let Some(deployed) = deployed else {
+        return LiveMatch::Unknown;
+    };
+    if deployed.is_empty() || deployed == "unknown" || current.is_empty() || current == "unknown" {
+        return LiveMatch::Unknown;
+    }
+    if deployed == current {
+        LiveMatch::Matches
+    } else {
+        LiveMatch::Differs
+    }
 }
 
 /// Whether the live install currently carries the mod sentinel.
@@ -154,28 +201,63 @@ pub fn launch(plan: &LaunchPlan) -> Result<String, String> {
     }
 }
 
+/// True when the game is currently running (checked via `tasklist`).
+/// Deploying over a running game corrupts the install (locked files
+/// under a wipe-and-restore), so deploy refuses in that case.
+pub fn is_game_running() -> bool {
+    let mut cmd = std::process::Command::new("tasklist");
+    // `tasklist` is a console program: hide it like the git calls.
+    crate::git::hide_child_console(&mut cmd);
+    match cmd
+        .arg("/FI")
+        .arg(format!("IMAGENAME eq {GAME_EXE_NAME}"))
+        .arg("/FO")
+        .arg("CSV")
+        .arg("/NH")
+        .output()
+    {
+        Ok(o) if o.status.success() => tasklist_shows_exe(&String::from_utf8_lossy(&o.stdout)),
+        // `tasklist` missing/failed: fail open (can't prove it runs).
+        _ => false,
+    }
+}
+
+/// Parse `tasklist /FO CSV /NH` output: a match row quotes the exe name,
+/// a miss prints an INFO line without it.
+fn tasklist_shows_exe(output: &str) -> bool {
+    output.to_lowercase().contains(GAME_EXE_NAME_LOWER)
+}
+
 /// Deploy the mod: run `Install DowagerMod.bat` (self-elevates via UAC),
-/// falling back to the installer exe when the bat is missing.
-pub fn deploy(repo: &std::path::Path) -> Result<String, String> {
+/// falling back to the installer exe when the bat is missing. Refuses
+/// while the game runs. Returns the child process so the caller can wait
+/// on it (single-flight: no second deploy until this one ends).
+///
+/// Note: the child's console is intentionally NOT hidden — the installer
+/// interacts with the user in its own window.
+pub fn deploy(repo: &Path) -> Result<Child, String> {
     let bat = crate::git::deploy_script(repo);
-    if bat.is_file() {
+    let use_bat = bat.is_file();
+    let exe = crate::git::installer_exe(repo);
+    if !use_bat && !exe.is_file() {
+        return Err("no installer found: expected Install DowagerMod.bat in the repo".to_string());
+    }
+    if is_game_running() {
+        return Err("deploy refused: Civ4 is running — quit the game first".to_string());
+    }
+    if use_bat {
         std::process::Command::new("cmd")
             .arg("/C")
             .arg(format!("\"{}\"", bat.display()))
             .current_dir(repo)
             .spawn()
-            .map_err(|e| format!("failed to start installer: {e}"))?;
-        return Ok("installer started (approve the UAC prompt)".to_string());
-    }
-    let exe = crate::git::installer_exe(repo);
-    if exe.is_file() {
+            .map_err(|e| format!("failed to start installer: {e}"))
+    } else {
         std::process::Command::new(&exe)
             .current_dir(repo)
             .spawn()
-            .map_err(|e| format!("failed to start installer: {e}"))?;
-        return Ok("installer started (approve the UAC prompt)".to_string());
+            .map_err(|e| format!("failed to start installer: {e}"))
     }
-    Err("no installer found: expected Install DowagerMod.bat in the repo".to_string())
 }
 
 #[cfg(test)]
@@ -199,5 +281,36 @@ mod tests {
             exe_in(&dir),
             PathBuf::from("C:\\game\\Beyond the Sword\\Civ4BeyondSword.exe")
         );
+    }
+
+    #[test]
+    fn tasklist_parse_spots_running_game() {
+        assert_eq!(GAME_EXE_NAME.to_lowercase(), GAME_EXE_NAME_LOWER);
+        assert!(tasklist_shows_exe(
+            "\"Civ4BeyondSword.exe\",\"1234\",\"Console\",\"1\",\"1,024 K\""
+        ));
+        assert!(tasklist_shows_exe(
+            "\"civ4beyondsword.EXE\",\"1\",\"C\",\"1\",\"1 K\""
+        ));
+        assert!(!tasklist_shows_exe(
+            "INFO: No tasks are running which match the specified criteria."
+        ));
+        assert!(!tasklist_shows_exe(""));
+    }
+
+    #[test]
+    fn version_matching_handles_unknowns() {
+        assert_eq!(match_versions(Some("abc123"), "abc123"), LiveMatch::Matches);
+        assert_eq!(match_versions(Some("abc123"), "def456"), LiveMatch::Differs);
+        assert_eq!(match_versions(None, "abc123"), LiveMatch::Unknown);
+        assert_eq!(
+            match_versions(Some("unknown"), "abc123"),
+            LiveMatch::Unknown
+        );
+        assert_eq!(
+            match_versions(Some("abc123"), "unknown"),
+            LiveMatch::Unknown
+        );
+        assert_eq!(match_versions(Some(""), "abc123"), LiveMatch::Unknown);
     }
 }

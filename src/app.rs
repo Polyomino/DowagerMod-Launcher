@@ -18,14 +18,21 @@ const WARN_AMBER: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA8, 0x3C);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x6C, 0x5B);
 
 /// Message from a background worker thread to the UI thread.
+/// Every variant but `Deployed` carries the job epoch: results from an
+/// older epoch (orphaned by a newer spawn or a repo switch) are dropped.
 enum JobOut {
-    /// Full refresh finished: refresh epoch plus status + branches, or an
-    /// error string. Stale epochs (a newer refresh is in flight) are dropped.
-    Refreshed(u64, Result<(RepoStatus, Vec<BranchInfo>), String>),
+    /// Full refresh finished: status + branches + live-match, or an error.
+    Refreshed(
+        u64,
+        Result<(RepoStatus, Vec<BranchInfo>, civ::LiveMatch), String>,
+    ),
     /// Fast-forward to the remote tip finished.
-    Updated(Result<String, String>),
+    Updated(u64, Result<String, String>),
     /// `git checkout` finished.
-    CheckedOut(Result<String, String>),
+    CheckedOut(u64, Result<String, String>),
+    /// Installer child process exited (deploy cannot overlap anything,
+    /// so no epoch is needed).
+    Deployed,
 }
 
 /// One-time theme setup: bronze selection, roomier spacing.
@@ -90,17 +97,31 @@ fn move_selection(selected: usize, count: usize, down: bool) -> (usize, bool) {
     (next, next != selected)
 }
 
-/// Cheap error sniffing so failures stand out in the log line.
+/// Error sniffing so failures stand out in the log line. Matches our
+/// own failure prefixes plus git's `error:`/`fatal:` markers — deliberately
+/// NOT bare substrings like "error", which also appear in success output
+/// (e.g. a fast-forward listing `error_handler.py`). `:` is illegal in
+/// Windows filenames, so the colon markers can't false-positive there.
 fn looks_like_error(log: &str) -> bool {
     let lower = log.to_lowercase();
     [
-        "fail",
-        "error",
-        "denied",
+        "update failed",
+        "switch failed",
+        "refresh failed",
+        "fetch failed",
+        "save failed",
+        "failed to ",
+        "failed:",
+        "error:",
+        "fatal:",
         "refus",
-        "not found",
-        "missing",
         "timed out",
+        "not found",
+        "not a git checkout",
+        "no installer found",
+        "no remote tip",
+        "not on a branch",
+        "no mod checkout",
     ]
     .iter()
     .any(|k| lower.contains(k))
@@ -173,11 +194,15 @@ pub struct LauncherApp {
     draft_app_id: String,
     draft_exe: String,
     focused_search: bool,
-    refresh_epoch: u64,
+    job_epoch: u64,
     /// Set when keyboard nav (or a filter change) moves the selection:
     /// the list scrolls to the row exactly once, then this clears. Mouse
     /// scrolling never sets it, so the view can't snap back mid-scroll.
     scroll_to_selected: bool,
+    /// An installer child is running: no second deploy, no launch, and no
+    /// git jobs (the payload must not change mid-install).
+    deploying: bool,
+    live_match: civ::LiveMatch,
     tx: Sender<JobOut>,
     rx: Receiver<JobOut>,
 }
@@ -206,8 +231,10 @@ impl LauncherApp {
             show_settings: false,
             draft_repo_path,
             focused_search: false,
-            refresh_epoch: 0,
+            job_epoch: 0,
             scroll_to_selected: false,
+            deploying: false,
+            live_match: civ::LiveMatch::Unknown,
             tx,
             rx,
         };
@@ -238,12 +265,12 @@ impl LauncherApp {
         } else {
             "refreshing…".to_string()
         });
-        self.refresh_epoch += 1;
-        let epoch = self.refresh_epoch;
+        self.job_epoch += 1;
+        let epoch = self.job_epoch;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let out = git::status(&repo, fetch_first)
-                .and_then(|st| git::branches(&repo).map(|list| (st, list)));
+                .and_then(|st| git::branches(&repo).map(|list| (st, list, civ::live_match(&repo))));
             let _ = tx.send(JobOut::Refreshed(epoch, out));
         });
     }
@@ -253,9 +280,11 @@ impl LauncherApp {
             return;
         };
         self.busy = Some("updating…".to_string());
+        self.job_epoch += 1;
+        let epoch = self.job_epoch;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(JobOut::Updated(git::update_to_latest(&repo)));
+            let _ = tx.send(JobOut::Updated(epoch, git::update_to_latest(&repo)));
         });
     }
 
@@ -264,18 +293,43 @@ impl LauncherApp {
             return;
         };
         self.busy = Some(format!("switching to {branch}…"));
+        self.job_epoch += 1;
+        let epoch = self.job_epoch;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(JobOut::CheckedOut(git::checkout(&repo, &branch)));
+            let _ = tx.send(JobOut::CheckedOut(epoch, git::checkout(&repo, &branch)));
         });
+    }
+
+    fn spawn_deploy(&mut self) {
+        if self.deploying || self.busy.is_some() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            self.log = "no mod checkout configured".to_string();
+            return;
+        };
+        match civ::deploy(&repo) {
+            Ok(child) => {
+                self.deploying = true;
+                self.log = "installer started (approve the UAC prompt)".to_string();
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                    let _ = tx.send(JobOut::Deployed);
+                });
+            }
+            Err(e) => self.log = e,
+        }
     }
 
     fn poll_jobs(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
             match job {
-                JobOut::Refreshed(epoch, Ok((mut st, list))) => {
-                    if epoch != self.refresh_epoch {
-                        continue; // stale: a newer refresh is in flight
+                JobOut::Refreshed(epoch, Ok((mut st, list, live))) => {
+                    if epoch != self.job_epoch {
+                        continue; // stale: orphaned by a newer spawn
                     }
                     // Local-only refreshes (after update/checkout) carry no
                     // fetch info: keep the previous fetch state instead of
@@ -290,19 +344,23 @@ impl LauncherApp {
                     let keep = self.filtered().get(self.selected).map(|b| b.name.clone());
                     self.status = Some(st);
                     self.branches = list;
+                    self.live_match = live;
                     self.selected = keep
                         .and_then(|name| self.filtered().iter().position(|b| b.name == name))
                         .unwrap_or(0);
                     self.busy = None;
                 }
                 JobOut::Refreshed(epoch, Err(e)) => {
-                    if epoch != self.refresh_epoch {
-                        continue; // stale: a newer refresh is in flight
+                    if epoch != self.job_epoch {
+                        continue; // stale: orphaned by a newer spawn
                     }
                     self.log = format!("refresh failed: {e}");
                     self.busy = None;
                 }
-                JobOut::Updated(Ok(out)) => {
+                JobOut::Updated(epoch, Ok(out)) => {
+                    if epoch != self.job_epoch {
+                        continue;
+                    }
                     self.log = if out.is_empty() {
                         "already up to date".to_string()
                     } else {
@@ -310,17 +368,32 @@ impl LauncherApp {
                     };
                     self.spawn_refresh(false);
                 }
-                JobOut::Updated(Err(e)) => {
+                JobOut::Updated(epoch, Err(e)) => {
+                    if epoch != self.job_epoch {
+                        continue;
+                    }
                     self.log = format!("update failed: {e}");
                     self.busy = None;
                 }
-                JobOut::CheckedOut(Ok(_)) => {
+                JobOut::CheckedOut(epoch, Ok(_)) => {
+                    if epoch != self.job_epoch {
+                        continue;
+                    }
                     self.log = "branch switched".to_string();
                     self.spawn_refresh(false);
                 }
-                JobOut::CheckedOut(Err(e)) => {
+                JobOut::CheckedOut(epoch, Err(e)) => {
+                    if epoch != self.job_epoch {
+                        continue;
+                    }
                     self.log = format!("switch failed: {e}");
                     self.busy = None;
+                }
+                JobOut::Deployed => {
+                    self.deploying = false;
+                    self.log = "installer window closed".to_string();
+                    // Recompute the live-match line (deploy rewrote it).
+                    self.spawn_refresh(false);
                 }
             }
         }
@@ -332,8 +405,9 @@ impl LauncherApp {
 
     fn checkout_selected(&mut self) {
         // Enter/double-click bypass the disabled-button gate, so guard here:
-        // overlapping git jobs fight over the repo lock.
-        if self.busy.is_some() {
+        // overlapping git jobs fight over the repo lock, and the payload
+        // must not change while the installer reads it.
+        if self.busy.is_some() || self.deploying {
             return;
         }
         if let Some(b) = self.filtered().get(self.selected).map(|b| b.name.clone()) {
@@ -352,7 +426,7 @@ fn now_unix() -> i64 {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.deploying {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
@@ -399,6 +473,12 @@ impl eframe::App for LauncherApp {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(egui::RichText::new(busy).weak());
+                });
+            }
+            if self.deploying {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("installer running…").weak());
                 });
             }
             if !self.log.is_empty() {
@@ -497,10 +577,11 @@ impl LauncherApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             // No status (or a detached HEAD) means there is nothing sane to
-            // fast-forward; the git layer re-checks anyway.
+            // fast-forward; the git layer re-checks anyway. Blocked while
+            // deploying: the payload must not change mid-install.
             let can_update =
                 self.repo.is_some() && matches!(&self.status, Some(st) if !st.detached);
-            let enabled = self.busy.is_none() && can_update;
+            let enabled = self.busy.is_none() && !self.deploying && can_update;
             if ui
                 .add_enabled(enabled, primary_button("Update to latest", enabled))
                 .clicked()
@@ -573,6 +654,9 @@ impl LauncherApp {
                     let resp = ui.selectable_label(i == self.selected, branch_row_job(b, &age, ui));
                     if resp.clicked() {
                         self.selected = i;
+                        // Rows aren't focusable: keep keyboard nav alive
+                        // by handing focus back to the filter box.
+                        ctx.memory_mut(|m| m.request_focus(search_id));
                     }
                     if resp.double_clicked() {
                         self.selected = i;
@@ -590,7 +674,7 @@ impl LauncherApp {
             });
         self.scroll_to_selected = false;
         ui.horizontal(|ui| {
-            let busy = self.busy.is_some() || self.repo.is_none();
+            let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
             if ui
                 .add_enabled(!busy, egui::Button::new("Switch to selected"))
                 .clicked()
@@ -628,9 +712,35 @@ impl LauncherApp {
                 } else {
                     WARN_AMBER
                 }));
+                if deployed {
+                    match self.live_match {
+                        civ::LiveMatch::Matches => {
+                            ui.label(
+                                egui::RichText::new("live install matches this checkout")
+                                    .color(OK_GREEN),
+                            );
+                        }
+                        civ::LiveMatch::Differs => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "live install differs from this checkout — run Deploy",
+                                )
+                                .color(WARN_AMBER),
+                            );
+                        }
+                        civ::LiveMatch::Unknown => {}
+                    }
+                }
                 if let Some(v) = civ::last_deployed_version() {
                     ui.label(
                         egui::RichText::new(format!("last deployed mod version: {v}"))
+                            .small()
+                            .weak(),
+                    );
+                }
+                if let Some(at) = civ::last_deployed_at() {
+                    ui.label(
+                        egui::RichText::new(format!("last deployed: {}", at.replace('T', " ")))
                             .small()
                             .weak(),
                     );
@@ -646,9 +756,15 @@ impl LauncherApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             // Launch stays enabled without a repo: the Steam fallback
-            // needs no checkout.
+            // needs no checkout. Blocked while deploying: launching
+            // mid-wipe would start a half-mirrored game.
+            let can_launch = !self.deploying;
             if ui
-                .add(primary_button("Launch Civ4 with DowagerMod", true))
+                .add_enabled(
+                    can_launch,
+                    primary_button("Launch Civ4 with DowagerMod", can_launch),
+                )
+                .on_disabled_hover_text("installer is running — close its window first")
                 .clicked()
             {
                 match civ::launch(&plan) {
@@ -656,18 +772,12 @@ impl LauncherApp {
                     Err(e) => self.log = e,
                 }
             }
-            let busy = self.busy.is_some() || self.repo.is_none();
+            let busy = self.busy.is_some() || self.deploying || self.repo.is_none();
             if ui
                 .add_enabled(!busy, egui::Button::new("Deploy to Civ4"))
                 .clicked()
             {
-                match self.repo.clone() {
-                    Some(repo) => match civ::deploy(&repo) {
-                        Ok(msg) => self.log = msg,
-                        Err(e) => self.log = e,
-                    },
-                    None => self.log = "no mod checkout configured".to_string(),
-                }
+                self.spawn_deploy();
             }
         });
         ui.label(
@@ -707,7 +817,14 @@ impl LauncherApp {
                 ui.end_row();
             });
         ui.add_space(4.0);
-        if ui.button("Save").clicked() {
+        // Gated while any job runs: a repo switch must not overlap git
+        // (lock fights) or the installer (payload reads). Bounded by the
+        // 90s git timeout at worst.
+        let save_idle = self.busy.is_none() && !self.deploying;
+        if ui
+            .add_enabled(save_idle, egui::Button::new("Save"))
+            .clicked()
+        {
             self.config.mod_repo_path = self.draft_repo_path.trim().to_string();
             self.config.steam_app_id =
                 config::parse_app_id(&self.draft_app_id, self.config.steam_app_id);
@@ -717,11 +834,18 @@ impl LauncherApp {
                 Err(e) => self.log = format!("save failed: {e}"),
             }
             self.repo = self.config.repo_path();
-            // Never show the previous repo's status under a new path.
+            // Orphan anything still in flight (defensive: Save is gated,
+            // but a result could already be queued) and never show the
+            // previous repo's status under a new path.
+            self.job_epoch += 1;
             self.status = None;
             self.branches.clear();
             self.selected = 0;
             self.show_settings = self.repo.is_none();
+            if self.repo.is_none() {
+                // Nothing will complete: don't wedge `busy` on.
+                self.busy = None;
+            }
             self.spawn_refresh(true);
         }
     }
@@ -770,9 +894,19 @@ mod tests {
         assert!(looks_like_error("fetch failed (offline?): nope"));
         assert!(looks_like_error("update failed: Permission denied"));
         assert!(looks_like_error("git fetch timed out after 90s"));
+        assert!(looks_like_error(
+            "deploy refused: Civ4 is running — quit the game first"
+        ));
+        assert!(looks_like_error("not a git checkout: C:\\nope"));
+        assert!(looks_like_error("error: cannot open '.git/FETCH_HEAD'"));
         assert!(!looks_like_error("already up to date"));
         assert!(!looks_like_error("branch switched"));
         assert!(!looks_like_error("settings saved"));
+        assert!(!looks_like_error("installer window closed"));
         assert!(!looks_like_error(""));
+        // Success output naming an `error_*` file must stay unflagged.
+        assert!(!looks_like_error(
+            "Updating abc..def\nFast-forward\n error_handler.py | 2 +-"
+        ));
     }
 }
