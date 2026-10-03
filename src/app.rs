@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::LauncherConfig;
 use crate::git::{self, BranchInfo, RepoStatus};
-use crate::{civ, config, report};
+use crate::{civ, config, report, update};
 
 /// Warm bronze accent — Civ-appropriate, and deliberately not the
 /// purple/blue default.
@@ -36,6 +36,12 @@ enum JobOut {
     /// Bug-report submit finished: issue URL / fallback note, or a reason.
     /// Independent of repo switches (it files a snapshot), so no epoch.
     Reported(Result<String, String>),
+    /// Update check finished: a newer release, up-to-date, or a reason.
+    /// No epoch (nothing about the repo can orphan it).
+    UpdateCheck(Result<Option<update::ReleaseInfo>, String>),
+    /// Update download/apply failed (success exits the process, so only
+    /// failure needs a message).
+    UpdateFailed(String),
 }
 
 /// One-time theme setup: bronze selection, roomier spacing.
@@ -118,6 +124,7 @@ fn looks_like_error(log: &str) -> bool {
         "refresh failed",
         "fetch failed",
         "report failed",
+        "update failed",
         "save failed",
         "failed to ",
         "failed:",
@@ -236,6 +243,11 @@ pub struct LauncherApp {
     report_preview: Option<String>,
     report_sending: bool,
     report_result: String,
+    update_offer: Option<update::ReleaseInfo>,
+    update_checking: bool,
+    update_downloading: bool,
+    update_status: String,
+    update_error: String,
     tx: Sender<JobOut>,
     rx: Receiver<JobOut>,
 }
@@ -275,6 +287,11 @@ impl LauncherApp {
             report_preview: None,
             report_sending: false,
             report_result: String::new(),
+            update_offer: None,
+            update_checking: false,
+            update_downloading: false,
+            update_status: String::new(),
+            update_error: String::new(),
             tx,
             rx,
         };
@@ -292,6 +309,10 @@ impl LauncherApp {
         } else {
             app.set_log("DowagerMod checkout not found — set the path in Settings.".to_string());
             app.show_settings = true;
+        }
+        // Self-update check in the background (skipped for dev builds).
+        if update::should_check() {
+            app.spawn_update_check();
         }
         app
     }
@@ -409,6 +430,56 @@ impl LauncherApp {
         report::render_markdown(&self.report_desc, &sections)
     }
 
+    fn spawn_update_check(&mut self) {
+        if self.update_checking || self.update_downloading {
+            return;
+        }
+        self.update_checking = true;
+        self.update_status = "checking…".to_string();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let local = update::local_version();
+            let out = match update::fetch_latest() {
+                Ok(rel) if update::is_newer(&local, &rel.tag) => Ok(Some(rel)),
+                Ok(_) => Ok(None),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(JobOut::UpdateCheck(out));
+        });
+    }
+
+    fn spawn_update_download(&mut self, rel: update::ReleaseInfo) {
+        if self.update_downloading {
+            return;
+        }
+        // The offer dialog can appear in a dev build via the manual
+        // Settings check: never let it swap a dev binary.
+        if !update::should_check() {
+            self.update_error = "self-update is disabled for dev builds".to_string();
+            return;
+        }
+        self.update_downloading = true;
+        self.update_error.clear();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let exe = std::env::current_exe()
+                    .map_err(|e| format!("cannot locate running exe: {e}"))?;
+                let pending = update::pending_path(&exe);
+                update::download(&rel.exe_url, &pending)?;
+                update::spawn_updater(&exe, &pending)?;
+                Ok(())
+            })();
+            match outcome {
+                // Swap staged: exit at once so the updater can move the exe.
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    let _ = tx.send(JobOut::UpdateFailed(e));
+                }
+            }
+        });
+    }
+
     fn poll_jobs(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
             match job {
@@ -503,6 +574,25 @@ impl LauncherApp {
                     self.report_sending = false;
                     self.set_log(format!("report failed: {e}"));
                     self.report_result = format!("report failed: {e}");
+                }
+                JobOut::UpdateCheck(Ok(Some(rel))) => {
+                    self.update_checking = false;
+                    self.update_status = format!("{} available", rel.tag);
+                    self.update_offer = Some(rel);
+                }
+                JobOut::UpdateCheck(Ok(None)) => {
+                    self.update_checking = false;
+                    self.update_status =
+                        format!("you're on the latest (v{})", update::local_version());
+                }
+                JobOut::UpdateCheck(Err(e)) => {
+                    self.update_checking = false;
+                    self.update_status = format!("last check failed: {e}");
+                }
+                JobOut::UpdateFailed(e) => {
+                    self.update_downloading = false;
+                    self.set_log(format!("update failed: {e}"));
+                    self.update_error = format!("update failed: {e}");
                 }
             }
         }
@@ -666,6 +756,13 @@ impl eframe::App for LauncherApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
             self.report_ui(ctx);
+        }
+
+        if self.update_offer.is_some() {
+            if self.update_downloading {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            self.update_ui(ctx);
         }
     }
 }
@@ -1037,6 +1134,26 @@ impl LauncherApp {
                     .weak(),
             );
         });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let checking = self.update_checking || self.update_downloading;
+            if ui
+                .add_enabled(!checking, egui::Button::new("Check for updates"))
+                .on_hover_text("Check GitHub Releases for a newer launcher build")
+                .clicked()
+            {
+                self.spawn_update_check();
+            }
+            if self.update_status.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("launcher v{}", update::local_version()))
+                        .small()
+                        .weak(),
+                );
+            } else {
+                ui.label(egui::RichText::new(&self.update_status).small().weak());
+            }
+        });
     }
 
     fn report_ui(&mut self, ctx: &egui::Context) {
@@ -1148,6 +1265,69 @@ impl LauncherApp {
                 });
             });
         self.show_report = open;
+    }
+
+    fn update_ui(&mut self, ctx: &egui::Context) {
+        let Some(offer) = self.update_offer.clone() else {
+            return;
+        };
+        // Closing the window is "Later" (same as the button below).
+        let mut open = true;
+        egui::Window::new("Update available")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} is available (you have v{}).",
+                    offer.tag,
+                    update::local_version()
+                ));
+                ui.label(
+                    egui::RichText::new("Update downloads the new build and restarts.")
+                        .small()
+                        .weak(),
+                );
+                if !self.update_error.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(&self.update_error)
+                            .small()
+                            .color(ERR_RED),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Or get it here:").small().weak());
+                        ui.hyperlink(update::release_page_url(&offer.tag));
+                    });
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let downloading = self.update_downloading;
+                    let can_update = !downloading;
+                    if ui
+                        .add_enabled(can_update, primary_button("Update & restart", can_update))
+                        .on_hover_text("Download the new build and restart the launcher")
+                        .clicked()
+                    {
+                        self.spawn_update_download(offer.clone());
+                    }
+                    if ui
+                        .add_enabled(!downloading, egui::Button::new("Later"))
+                        .clicked()
+                    {
+                        self.update_offer = None;
+                        self.update_error.clear();
+                    }
+                    if downloading {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("downloading…").weak());
+                    }
+                });
+            });
+        if !open {
+            self.update_offer = None;
+            self.update_error.clear();
+        }
     }
 }
 

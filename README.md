@@ -36,6 +36,10 @@ Sid Meier's Civilization IV: Beyond the Sword mod — is installed on the system
 - **Settings** — the mod repo path is configurable and persisted to
   `%APPDATA%\DowagerMod-Launcher\config.json` (auto-detects a `DowagerMod`
   folder next to the launcher otherwise).
+- **Self-update** — on startup the launcher checks GitHub Releases for a
+  newer build and offers to download, install, and restart into it (also
+  re-checkable from Settings). Cutting a `v*` tag publishes a release via
+  the release workflow.
 
 ## Prerequisites
 

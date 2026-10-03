@@ -7,6 +7,7 @@ mod config;
 mod git;
 mod log;
 mod report;
+mod update;
 
 use app::LauncherApp;
 
