@@ -1,6 +1,6 @@
 [package]
 name = "dowager-mod-launcher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Desktop launcher for DowagerMod (Civ4: Beyond the Sword): branch status, one-click update, branch switching, game launch"
