@@ -11,7 +11,10 @@ use app::LauncherApp;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 560.0])
+            // Tall enough for header + status card + full branch list +
+            // Civ section + log with no outer scrolling.
+            .with_inner_size([760.0, 880.0])
+            .with_min_inner_size([620.0, 460.0])
             .with_title("DowagerMod Launcher"),
         ..Default::default()
     };

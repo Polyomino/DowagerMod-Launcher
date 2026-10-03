@@ -8,15 +8,155 @@ use crate::config::LauncherConfig;
 use crate::git::{self, BranchInfo, RepoStatus};
 use crate::{civ, config};
 
+/// Warm bronze accent — Civ-appropriate, and deliberately not the
+/// purple/blue default.
+const BRONZE: egui::Color32 = egui::Color32::from_rgb(0xC9, 0xA2, 0x27);
+const BRONZE_LIGHT: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xC0, 0x5A);
+const INK_ON_BRONZE: egui::Color32 = egui::Color32::from_rgb(0x20, 0x18, 0x06);
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x7B, 0xC7, 0x6E);
+const WARN_AMBER: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA8, 0x3C);
+const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x6C, 0x5B);
+
 /// Message from a background worker thread to the UI thread.
 enum JobOut {
     /// Full refresh finished: refresh epoch plus status + branches, or an
     /// error string. Stale epochs (a newer refresh is in flight) are dropped.
     Refreshed(u64, Result<(RepoStatus, Vec<BranchInfo>), String>),
-    /// `git pull --ff-only` finished.
+    /// Fast-forward to the remote tip finished.
     Updated(Result<String, String>),
     /// `git checkout` finished.
     CheckedOut(Result<String, String>),
+}
+
+/// One-time theme setup: bronze selection, roomier spacing.
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0xC9, 0xA2, 0x27, 0x3C);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, BRONZE);
+    style.visuals.hyperlink_color = BRONZE_LIGHT;
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.indent = 18.0;
+    ctx.set_style(style);
+}
+
+/// The one headline action per section: bronze fill, dark text.
+/// An explicit dimmed look when disabled (an explicit `.fill` would
+/// otherwise stay bright under `add_enabled(false, …)`).
+fn primary_button(text: &str, enabled: bool) -> egui::Button<'_> {
+    let (fill, ink) = if enabled {
+        (BRONZE, INK_ON_BRONZE)
+    } else {
+        (
+            egui::Color32::from_rgb(0x4A, 0x40, 0x22),
+            egui::Color32::from_rgb(0x8A, 0x80, 0x66),
+        )
+    };
+    egui::Button::new(egui::RichText::new(text).color(ink).strong())
+        .fill(fill)
+        .min_size(egui::vec2(160.0, 32.0))
+}
+
+fn section_title(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new(title).size(16.0).strong());
+    ui.add_space(4.0);
+}
+
+/// Color for the behind/ahead line: green when synced, amber when behind,
+/// red when detached (nothing sane to update to).
+fn distance_color(st: &RepoStatus) -> egui::Color32 {
+    if st.detached {
+        ERR_RED
+    } else if st.behind > 0 {
+        WARN_AMBER
+    } else {
+        OK_GREEN
+    }
+}
+
+/// Clamp a Up/Down selection move into `0..count`. Returns the new
+/// index plus whether it actually moved (drives one-shot list scroll).
+fn move_selection(selected: usize, count: usize, down: bool) -> (usize, bool) {
+    if count == 0 {
+        return (0, false);
+    }
+    let selected = selected.min(count - 1);
+    let next = if down {
+        (selected + 1).min(count - 1)
+    } else {
+        selected.saturating_sub(1)
+    };
+    (next, next != selected)
+}
+
+/// Cheap error sniffing so failures stand out in the log line.
+fn looks_like_error(log: &str) -> bool {
+    let lower = log.to_lowercase();
+    [
+        "fail",
+        "error",
+        "denied",
+        "refus",
+        "not found",
+        "missing",
+        "timed out",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+/// One branch row: name prominent (bronze when current), hash/time/subject
+/// dimmed, remote tag italic. Single-line `LayoutJob` so the whole row
+/// stays one selectable unit.
+fn branch_row_job(b: &BranchInfo, age: &str, ui: &egui::Ui) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let weak = ui.visuals().weak_text_color();
+    let mut job = LayoutJob::default();
+    job.append(
+        &b.name,
+        0.0,
+        TextFormat {
+            font_id: egui::FontId::proportional(13.5),
+            color: if b.is_current {
+                BRONZE_LIGHT
+            } else {
+                ui.visuals().strong_text_color()
+            },
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!("  {}", b.short_hash),
+        0.0,
+        TextFormat {
+            font_id: egui::FontId::monospace(12.0),
+            color: weak,
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!("  {age}  {}", b.subject),
+        0.0,
+        TextFormat {
+            font_id: egui::FontId::proportional(12.0),
+            color: weak,
+            ..Default::default()
+        },
+    );
+    if b.remote_only {
+        job.append(
+            "  [remote]",
+            0.0,
+            TextFormat {
+                font_id: egui::FontId::proportional(12.0),
+                color: weak,
+                italics: true,
+                ..Default::default()
+            },
+        );
+    }
+    job
 }
 
 pub struct LauncherApp {
@@ -34,12 +174,17 @@ pub struct LauncherApp {
     draft_exe: String,
     focused_search: bool,
     refresh_epoch: u64,
+    /// Set when keyboard nav (or a filter change) moves the selection:
+    /// the list scrolls to the row exactly once, then this clears. Mouse
+    /// scrolling never sets it, so the view can't snap back mid-scroll.
+    scroll_to_selected: bool,
     tx: Sender<JobOut>,
     rx: Receiver<JobOut>,
 }
 
 impl LauncherApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_style(&cc.egui_ctx);
         let config = LauncherConfig::load();
         let repo = config.repo_path();
         // Draft mirrors the stored value verbatim: empty means auto-detect.
@@ -62,6 +207,7 @@ impl LauncherApp {
             draft_repo_path,
             focused_search: false,
             refresh_epoch: 0,
+            scroll_to_selected: false,
             tx,
             rx,
         };
@@ -211,17 +357,28 @@ impl eframe::App for LauncherApp {
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("DowagerMod Launcher");
+                ui.label(
+                    egui::RichText::new("DowagerMod Launcher")
+                        .size(22.0)
+                        .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.show_settings = !self.show_settings;
                     }
                 });
             });
+            ui.add_space(2.0);
             match &self.repo {
                 Some(repo) => {
-                    ui.label(format!("mod: {}", repo.to_string_lossy()));
+                    ui.label(
+                        egui::RichText::new(format!("mod: {}", repo.to_string_lossy()))
+                            .monospace()
+                            .small()
+                            .weak(),
+                    );
                 }
                 None => {
                     let configured = self.config.mod_repo_path.trim();
@@ -230,20 +387,27 @@ impl eframe::App for LauncherApp {
                     } else {
                         format!("configured mod path not found: {configured}")
                     };
-                    ui.colored_label(egui::Color32::YELLOW, msg);
+                    ui.label(egui::RichText::new(msg).color(WARN_AMBER));
                 }
             }
+            ui.add_space(4.0);
         });
 
         egui::TopBottomPanel::bottom("log").show(ctx, |ui| {
+            ui.add_space(2.0);
             if let Some(busy) = &self.busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(busy);
+                    ui.label(egui::RichText::new(busy).weak());
                 });
             }
             if !self.log.is_empty() {
-                ui.label(&self.log);
+                let color = if looks_like_error(&self.log) {
+                    ERR_RED
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                ui.label(egui::RichText::new(&self.log).small().color(color));
             }
         });
 
@@ -251,15 +415,20 @@ impl eframe::App for LauncherApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    ui.add_space(6.0);
                     if self.show_settings {
                         self.settings_ui(ui);
+                        ui.add_space(8.0);
                         ui.separator();
                     }
                     self.status_ui(ui);
+                    ui.add_space(8.0);
                     ui.separator();
                     self.branches_ui(ui, ctx);
+                    ui.add_space(8.0);
                     ui.separator();
                     self.civ_ui(ui);
+                    ui.add_space(6.0);
                 });
         });
     }
@@ -267,60 +436,73 @@ impl eframe::App for LauncherApp {
 
 impl LauncherApp {
     fn status_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Installed version");
+        section_title(ui, "Installed version");
         match &self.status {
             Some(st) => {
-                ui.horizontal(|ui| {
-                    ui.label("branch:");
-                    ui.monospace(&st.branch);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("commit:");
-                    ui.monospace(&st.short_hash);
-                    ui.label(&st.subject);
-                });
-                if !st.commit_date.is_empty() {
-                    ui.label(format!("date: {}", st.commit_date));
-                }
-                ui.label(git::distance_text(st));
-                match st
-                    .fetched_at
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                {
-                    Some(age) => {
-                        ui.label(format!(
-                            "last fetch: {}",
-                            git::relative_time(age.as_secs() as i64, now_unix())
-                        ));
-                    }
-                    None if st.fetch_error.is_none() => {
-                        ui.label("not fetched yet");
-                    }
-                    None => {
-                        ui.label("fetch state unknown");
-                    }
-                }
-                if let Some(err) = &st.fetch_error {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        format!("fetch failed (offline?): {err}"),
-                    );
-                }
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(12))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&st.branch).size(17.0).strong());
+                            ui.label(egui::RichText::new(&st.short_hash).monospace().weak());
+                            if !st.commit_date.is_empty() {
+                                ui.label(egui::RichText::new(&st.commit_date).weak());
+                            }
+                        });
+                        if !st.subject.is_empty() {
+                            ui.label(&st.subject);
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(git::distance_text(st))
+                                .color(distance_color(st))
+                                .strong(),
+                        );
+                        match st
+                            .fetched_at
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        {
+                            Some(age) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "last fetch: {}",
+                                        git::relative_time(age.as_secs() as i64, now_unix())
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            None if st.fetch_error.is_none() => {
+                                ui.label(egui::RichText::new("not fetched yet").small().weak());
+                            }
+                            None => {
+                                ui.label(egui::RichText::new("fetch state unknown").small().weak());
+                            }
+                        }
+                        if let Some(err) = &st.fetch_error {
+                            ui.label(
+                                egui::RichText::new(format!("fetch failed (offline?): {err}"))
+                                    .small()
+                                    .color(WARN_AMBER),
+                            );
+                        }
+                    });
             }
             None => {
-                ui.label("no status yet");
+                ui.label(egui::RichText::new("no status yet").weak());
             }
         }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             // No status (or a detached HEAD) means there is nothing sane to
             // fast-forward; the git layer re-checks anyway.
             let can_update =
                 self.repo.is_some() && matches!(&self.status, Some(st) if !st.detached);
+            let enabled = self.busy.is_none() && can_update;
             if ui
-                .add_enabled(
-                    self.busy.is_none() && can_update,
-                    egui::Button::new("Update to latest"),
-                )
+                .add_enabled(enabled, primary_button("Update to latest", enabled))
                 .clicked()
             {
                 self.spawn_update();
@@ -329,7 +511,19 @@ impl LauncherApp {
     }
 
     fn branches_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Branches (newest first)");
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Branches").size(16.0).strong());
+            let total = self.branches.len();
+            let shown = self.filtered().len();
+            let counts = if self.search.trim().is_empty() {
+                format!("{total} branches · newest first")
+            } else {
+                format!("{shown} of {total} · newest first")
+            };
+            ui.label(egui::RichText::new(counts).small().weak());
+        });
+        ui.add_space(4.0);
         let search_id = ui.make_persistent_id("branch-search");
         // Read navigation keys BEFORE the text box runs: a single-line
         // TextEdit surrenders focus on Enter, so checking focus afterwards
@@ -337,13 +531,15 @@ impl LauncherApp {
         let had_focus = ui.memory(|m| m.has_focus(search_id));
         if had_focus {
             let count = self.filtered().len();
-            if count > 0
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
-            {
-                self.selected = (self.selected + 1).min(count - 1);
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                let (next, moved) = move_selection(self.selected, count, true);
+                self.selected = next;
+                self.scroll_to_selected = moved;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-                self.selected = self.selected.saturating_sub(1);
+                let (next, moved) = move_selection(self.selected, count, false);
+                self.selected = next;
+                self.scroll_to_selected = moved;
             }
         }
         let resp = ui.add(
@@ -357,6 +553,7 @@ impl LauncherApp {
         }
         if resp.changed() {
             self.selected = 0;
+            self.scroll_to_selected = true;
         }
         // Single-line TextEdit surrenders focus on Enter: lost focus plus
         // the Enter key itself is the submit signal.
@@ -372,19 +569,8 @@ impl LauncherApp {
             .max_height(220.0)
             .show(ui, |ui| {
                 for (i, b) in filtered.iter().enumerate() {
-                    let label = format!(
-                        "{}  {}  {}  {}{}",
-                        b.name,
-                        b.short_hash,
-                        git::relative_time(b.commit_time_unix, now),
-                        b.subject,
-                        if b.remote_only { "  [remote]" } else { "" },
-                    );
-                    let mut text = egui::RichText::new(label);
-                    if b.is_current {
-                        text = text.strong();
-                    }
-                    let resp = ui.selectable_label(i == self.selected, text);
+                    let age = git::relative_time(b.commit_time_unix, now);
+                    let resp = ui.selectable_label(i == self.selected, branch_row_job(b, &age, ui));
                     if resp.clicked() {
                         self.selected = i;
                     }
@@ -392,16 +578,19 @@ impl LauncherApp {
                         self.selected = i;
                         self.checkout_selected();
                     }
-                    if i == self.selected {
-                        resp.scroll_to_me(Some(egui::Align::Center));
+                    if i == self.selected && self.scroll_to_selected {
+                        // `None` = minimal scroll: only moves when the row
+                        // is out of view (centering would yank on every key).
+                        resp.scroll_to_me(None);
                     }
                 }
                 if filtered.is_empty() {
                     ui.label("no branches match the filter");
                 }
             });
+        self.scroll_to_selected = false;
         ui.horizontal(|ui| {
-            let busy = self.busy.is_some();
+            let busy = self.busy.is_some() || self.repo.is_none();
             if ui
                 .add_enabled(!busy, egui::Button::new("Switch to selected"))
                 .clicked()
@@ -418,9 +607,14 @@ impl LauncherApp {
     }
 
     fn civ_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Civilization IV: Beyond the Sword");
+        section_title(ui, "Civilization IV: Beyond the Sword");
         let plan = civ::resolve(&self.config.civ_exe_override, self.config.steam_app_id);
-        ui.label(format!("launch via: {plan}"));
+        ui.label(
+            egui::RichText::new(format!("launch via: {plan}"))
+                .monospace()
+                .small()
+                .weak(),
+        );
         match civ::installed_game_dir() {
             Some(dir) => {
                 let deployed = civ::is_mod_deployed(&dir);
@@ -429,17 +623,34 @@ impl LauncherApp {
                 } else {
                     "live install found but mod sentinel missing — run Deploy"
                 };
-                ui.label(text);
+                ui.label(egui::RichText::new(text).color(if deployed {
+                    OK_GREEN
+                } else {
+                    WARN_AMBER
+                }));
                 if let Some(v) = civ::last_deployed_version() {
-                    ui.label(format!("last deployed mod version: {v}"));
+                    ui.label(
+                        egui::RichText::new(format!("last deployed mod version: {v}"))
+                            .small()
+                            .weak(),
+                    );
                 }
             }
             None => {
-                ui.label("live game install not found (installer has not run yet?)");
+                ui.label(
+                    egui::RichText::new("live game install not found (installer has not run yet?)")
+                        .color(WARN_AMBER),
+                );
             }
         }
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button("Launch Civ4 with DowagerMod").clicked() {
+            // Launch stays enabled without a repo: the Steam fallback
+            // needs no checkout.
+            if ui
+                .add(primary_button("Launch Civ4 with DowagerMod", true))
+                .clicked()
+            {
                 match civ::launch(&plan) {
                     Ok(msg) => self.log = msg,
                     Err(e) => self.log = e,
@@ -460,30 +671,42 @@ impl LauncherApp {
             }
         });
         ui.label(
-            "Deploy runs Install DowagerMod.bat (UAC prompt appears). Launch after deploying.",
+            egui::RichText::new(
+                "Deploy runs Install DowagerMod.bat (UAC prompt appears). Launch after deploying.",
+            )
+            .small()
+            .weak(),
         );
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.horizontal(|ui| {
-            ui.label("mod repo path:");
-            let detected = config::default_repo_path()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "auto-detect: not found".to_string());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft_repo_path)
-                    .hint_text(format!("empty = auto-detect ({detected})")),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("steam app id:");
-            ui.text_edit_singleline(&mut self.draft_app_id);
-        });
-        ui.horizontal(|ui| {
-            ui.label("civ exe override:");
-            ui.text_edit_singleline(&mut self.draft_exe);
-        });
+        section_title(ui, "Settings");
+        let detected = config::default_repo_path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "auto-detect: not found".to_string());
+        egui::Grid::new("settings-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Mod repo path:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.draft_repo_path)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(format!("empty = auto-detect ({detected})")),
+                );
+                ui.end_row();
+                ui.label("Steam app id:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.draft_app_id).desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+                ui.label("Civ exe override:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.draft_exe).desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+            });
+        ui.add_space(4.0);
         if ui.button("Save").clicked() {
             self.config.mod_repo_path = self.draft_repo_path.trim().to_string();
             self.config.steam_app_id =
@@ -501,5 +724,55 @@ impl LauncherApp {
             self.show_settings = self.repo.is_none();
             self.spawn_refresh(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distance_color_marks_sync_state() {
+        let synced = RepoStatus {
+            ..Default::default()
+        };
+        assert_eq!(distance_color(&synced), OK_GREEN);
+        let ahead_only = RepoStatus {
+            ahead: 3,
+            ..Default::default()
+        };
+        assert_eq!(distance_color(&ahead_only), OK_GREEN);
+        let behind = RepoStatus {
+            behind: 2,
+            ..Default::default()
+        };
+        assert_eq!(distance_color(&behind), WARN_AMBER);
+        let detached = RepoStatus {
+            detached: true,
+            ..Default::default()
+        };
+        assert_eq!(distance_color(&detached), ERR_RED);
+    }
+
+    #[test]
+    fn selection_moves_clamp_at_both_ends() {
+        assert_eq!(move_selection(0, 5, true), (1, true));
+        assert_eq!(move_selection(1, 5, false), (0, true));
+        assert_eq!(move_selection(4, 5, true), (4, false));
+        assert_eq!(move_selection(0, 5, false), (0, false));
+        assert_eq!(move_selection(0, 0, true), (0, false));
+        assert_eq!(move_selection(9, 5, true), (4, false));
+        assert_eq!(move_selection(9, 5, false), (3, true));
+    }
+
+    #[test]
+    fn error_sniffing_flags_failures_only() {
+        assert!(looks_like_error("fetch failed (offline?): nope"));
+        assert!(looks_like_error("update failed: Permission denied"));
+        assert!(looks_like_error("git fetch timed out after 90s"));
+        assert!(!looks_like_error("already up to date"));
+        assert!(!looks_like_error("branch switched"));
+        assert!(!looks_like_error("settings saved"));
+        assert!(!looks_like_error(""));
     }
 }

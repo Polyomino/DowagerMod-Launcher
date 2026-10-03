@@ -45,11 +45,25 @@ pub struct RepoStatus {
 /// never wedge on `busy` forever.
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Keep child consoles from flashing: without `CREATE_NO_WINDOW` every
+/// `git` spawn pops a visible console window from this GUI app.
+#[cfg(windows)]
+fn hide_child_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_child_console(_cmd: &mut Command) {}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     use std::io::Read;
     use std::process::Stdio;
 
-    let mut child = Command::new("git")
+    let mut cmd = Command::new("git");
+    hide_child_console(&mut cmd);
+    let mut child = cmd
         .arg("-C")
         .arg(repo)
         .args(args)
